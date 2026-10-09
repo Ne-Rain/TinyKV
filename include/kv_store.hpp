@@ -3,7 +3,7 @@
 #include <unordered_map>
 
 
-class KVStroe{
+class KVStore{
 public:
     bool set(const std::string& key, const std::string& value);
 
