@@ -19,8 +19,8 @@ bool KVStore::set(const std::string& key, const std::string& value) {
     // key不存在
     std::size_t add_used_bytes = key.size() + value.size();
     if (used_bytes_ + add_used_bytes <= max_bytes_) {
+        data_.emplace(key, value);
         used_bytes_ += add_used_bytes;
-        data_[key] = value;
         return true;
     }
     return false;

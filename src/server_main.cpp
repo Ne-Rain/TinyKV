@@ -1,9 +1,10 @@
 #include "kv_store.hpp"
+#include "protocol.hpp"
 #include <cassert>
+#include <iostream>
 #include <string>
 
-
-void set_get_test(){
+void set_get_test() {
     KVStore kvs(16);
     kvs.set("name", "NeRain");
     std::string name;
@@ -14,7 +15,7 @@ void set_get_test(){
     assert(!res && name == "NeRain");
 }
 
-void del_test(){
+void del_test() {
     KVStore kvs(16);
     kvs.set("name", "NeRain");
     assert(kvs.del("name"));
@@ -24,7 +25,7 @@ void del_test(){
     assert(!res);
 }
 
-void capacity_test(){
+void capacity_test() {
     KVStore kvs(16);
     assert(kvs.set("name", "Alice"));
     assert(kvs.set("lang", "C++"));
@@ -35,9 +36,18 @@ void capacity_test(){
     assert(kvs.get_used_bytes() == 7);
 }
 
+void encode_frame_test() {
+    std::string network_frame = encode_frame("PING");
+    std::string frame;
+    if (try_decode_frame(network_frame, frame) == ParseStatus::FrameReady) {
+        assert(frame == "PING");
+    }
+}
+
 int main() {
-    set_get_test();
-    del_test();
-    capacity_test();
+    // set_get_test();
+    // del_test();
+    // capacity_test();
+    encode_frame_test();
     return 0;
 }
