@@ -63,7 +63,7 @@ std::vector<std::string> split_command_text(const std::string& payload) {
     while (true) {
         std::size_t pos = payload.find(' ', start);
         if (pos == std::string::npos) {
-            tokens.push_back(payload.substr(start, payload.size() - start));
+            tokens.push_back(payload.substr(start));
             break;
         }
         tokens.push_back(payload.substr(start, pos - start));
@@ -87,10 +87,10 @@ bool parse_command(const std::string& payload, Command& command_out, std::string
         command.type = CommandType::Set;
         expected_tokens = 3;
     } else if (tokens[0] == "GET") {
-        command.type = CommandType::Set;
+        command.type = CommandType::Get;
         expected_tokens = 2;
     } else if (tokens[0] == "DEL") {
-        command.type = CommandType::Set;
+        command.type = CommandType::Del;
         expected_tokens = 2;
     } else {
         error_out = "ERR UNKNOWN_COMMAND";

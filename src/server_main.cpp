@@ -1,5 +1,6 @@
 #include "kv_store.hpp"
 #include "protocol.hpp"
+#include "command_executor.hpp"
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -130,6 +131,18 @@ void parse_command_test(){
     assert(error_out == "ERR UNKNOWN_COMMAND");
 }
 
+void command_executor_test(){
+    KVStore store(16);
+    assert(handle_payload(store, "PING") == "PONG");
+    assert(handle_payload(store, "SET name Alice") == "OK");
+    assert(handle_payload(store, "GET name") == "VALUE Alice");
+    assert(handle_payload(store, "GET name extra") == "ERR INVALID_ARGUMENT");
+    assert(handle_payload(store, "GET name") == "VALUE Alice");
+    assert(handle_payload(store, "DEL name") == "DELETED 1");
+    assert(handle_payload(store, "DEL name") == "DELETED 0");
+    assert(handle_payload(store, "GET name") == "NOT_FOUND");
+}
+
 int main() {
     // set_get_test();
     // del_test();
@@ -138,6 +151,7 @@ int main() {
     // fragmented_frame_test();
     // consecutive_frames_test();
     // split_command_text_test();
-    parse_command_test();
+    // parse_command_test();
+    command_executor_test();
     return 0;
 }
