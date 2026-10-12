@@ -1,3 +1,4 @@
+#pragma once
 #include "kv_store.hpp"
 #include "protocol.hpp"
 #include <cstring>

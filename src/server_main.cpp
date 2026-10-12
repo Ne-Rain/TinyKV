@@ -1,9 +1,14 @@
+#include "command_executor.hpp"
+#include "connection.hpp"
 #include "kv_store.hpp"
 #include "protocol.hpp"
-#include "command_executor.hpp"
 #include <cassert>
+#include <cstddef>
 #include <iostream>
+#include <netinet/in.h>
 #include <string>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <vector>
 
 void set_get_test() {
@@ -109,14 +114,14 @@ void consecutive_frames_test() {
     assert(payload_out == "GET k");
 }
 
-void split_command_text_test(){
+void split_command_text_test() {
     std::vector<std::string> vec = split_command_text("SET name Alice");
     assert(vec[0] == "SET");
     assert(vec[1] == "name");
     assert(vec[2] == "Alice");
 }
 
-void parse_command_test(){
+void parse_command_test() {
     Command command{};
     std::string error_out;
     assert(parse_command("PING", command, error_out));
@@ -131,7 +136,7 @@ void parse_command_test(){
     assert(error_out == "ERR UNKNOWN_COMMAND");
 }
 
-void command_executor_test(){
+void command_executor_test() {
     KVStore store(16);
     assert(handle_payload(store, "PING") == "PONG");
     assert(handle_payload(store, "SET name Alice") == "OK");
@@ -143,6 +148,50 @@ void command_executor_test(){
     assert(handle_payload(store, "GET name") == "NOT_FOUND");
 }
 
+void create_listen_socket_test() {
+    int listen_fd = create_listen_socket(8888);
+    if (listen_fd == -1) {
+        return;
+    }
+    sockaddr_in caddr{};
+    socklen_t len = sizeof(caddr);
+    int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+    if (client_fd == -1) {
+        assert(false);
+    }
+    char ip[32];
+    // 终端执行 nc 127.0.0.1 8888
+    // assert(std::string(inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip))) == "127.0.0.1");
+    std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':' << ntohs(caddr.sin_port)
+              << "\n";
+    KVStore store(1024 * 1024); // 1 MiB 的逻辑存储额度
+    std::string buffer;
+    char chunk[4096];
+    bool flag = true;
+
+    while (true) {
+        ssize_t received = recv(client_fd, chunk, sizeof(chunk), 0);
+        if (received > 0) {
+            buffer.append(chunk, static_cast<std::size_t>(received));
+            while (true) {
+                std::string payload;
+                ParseStatus status = try_decode_frame(buffer, payload);
+                if (status == ParseStatus::FrameReady) {
+                    std::string res = handle_payload(store, payload);
+                    std::cout << res << std::endl;
+                } else if (status == ParseStatus::ProtocolError) {
+                    flag = false;
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+        if (!flag)
+            break;
+    }
+}
+
 int main() {
     // set_get_test();
     // del_test();
@@ -152,6 +201,7 @@ int main() {
     // consecutive_frames_test();
     // split_command_text_test();
     // parse_command_test();
-    command_executor_test();
+    // command_executor_test();
+    create_listen_socket_test();
     return 0;
 }

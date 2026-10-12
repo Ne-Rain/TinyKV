@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 std::string encode_frame(const std::string& payload) {
     if (payload.empty() || payload.size() > 8192) {
