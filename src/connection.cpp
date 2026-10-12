@@ -1,4 +1,6 @@
 #include "connection.hpp"
+#include "command_executor.hpp"
+#include "protocol.hpp"
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstddef>
@@ -35,15 +37,49 @@ int create_listen_socket(std::uint16_t port) {
 
 bool send_all(int fd, const std::string& data) {
     std::size_t sent = 0;
-    while(sent < data.size()){
+    while (sent < data.size()) {
         ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
-        if(n > 0){
+        if (n > 0) {
             sent += n;
-        }else if(n == -1 && errno == EINTR){
+        } else if (n == -1 && errno == EINTR) {
             continue;
-        }else{
+        } else {
             return false;
         }
     }
     return true;
+}
+
+void handle_client(int client_fd, KVStore& store) {
+    std::string buffer;
+    char chunk[4096];
+    bool flag = true;
+
+    while (true) {
+        ssize_t received = recv(client_fd, chunk, sizeof(chunk), 0);
+        if (received > 0) {
+            buffer.append(chunk, static_cast<std::size_t>(received));
+            while (true) {
+                std::string payload;
+                ParseStatus status = try_decode_frame(buffer, payload);
+                if (status == ParseStatus::FrameReady) {
+                    std::string res = handle_payload(store, payload);
+                    std::string frame = encode_frame(res);
+                    if (!send_all(client_fd, frame)) {
+                        flag = false;
+                        break;
+                    }
+                } else if (status == ParseStatus::ProtocolError) {
+                    flag = false;
+                    break;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+        if (!flag)
+            break;
+    }
 }
