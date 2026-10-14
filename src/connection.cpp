@@ -92,45 +92,45 @@ void handle_client(int client_fd, KVStore& store) {
 
 int connect_to_server(const std::string& ip, std::uint16_t port) {
     int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd == -1) {
+        perror("socket");
+        return -1;
+    }
     sockaddr_in saddr{};
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htonl(port);
+    saddr.sin_port = htons(port);
     int res = inet_pton(AF_INET, ip.c_str(), &saddr.sin_addr);
     if (res != 1) {
-        perror("inet_pton");
         close(cfd);
-        return res;
+        return -1;
     }
     res = connect(cfd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr));
-    if (res == 0) {
+    if (res == -1) {
         perror("connect");
         close(cfd);
-        return 0;
+        return -1;
     }
     return cfd;
 }
 
 bool receive_frame(int fd, std::string& buffer, std::string& payload_out) {
     while (true) {
-        std::string payload;
-        ParseStatus status = try_decode_frame(buffer, payload);
+        ParseStatus status = try_decode_frame(buffer, payload_out);
         if (status == ParseStatus::FrameReady)
             return true;
         else if (status == ParseStatus::ProtocolError)
             return false;
         else {
-            while (true) {
-                char buf[1024];
-                ssize_t len = recv(fd, buf, sizeof(buf), 0);
-                if (len > 0) {
-                    buffer.append(buf, len);
-                } else if (len == 0) {
-                    if (errno == EINTR)
-                        continue;
-                    return false;
-                } else {
-                    return false;
-                }
+            char buf[1024];
+            ssize_t len = recv(fd, buf, sizeof(buf), 0);
+            if (len > 0) {
+                buffer.append(buf, len);
+            } else if (len == 0) {
+                return false;
+            } else {
+                if (errno == EINTR)
+                    continue;
+                return false;
             }
         }
     }

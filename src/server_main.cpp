@@ -170,7 +170,7 @@ void socket_test() {
         // 终端执行 nc 127.0.0.1 8888
         // assert(std::string(inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip))) == "127.0.0.1");
         std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':'
-                  << ntohs(caddr.sin_port) << "\n";
+                  << ntohs(caddr.sin_port) << std::endl;
         handle_client(client_fd, store);
         close(client_fd);
     }

@@ -9,11 +9,11 @@ int main() {
     const std::string ip = "127.0.0.1";
     std::uint16_t port = 8888;
     int cfd = connect_to_server(ip, port);
-    if (cfd <= 0)
+    if (cfd < 0)
         return 1;
     std::string request = encode_frame("PING");
     if (!send_all(cfd, request)) {
-        std::cerr << "send failed\n";
+        std::cerr << "send failed" << std::endl;
         close(cfd);
         return 1;
     }
