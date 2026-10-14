@@ -160,7 +160,11 @@ void socket_test() {
         socklen_t len = sizeof(caddr);
         int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &len);
         if (client_fd == -1) {
-            close(listen_fd);
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
         }
         char ip[32];
         // 终端执行 nc 127.0.0.1 8888
