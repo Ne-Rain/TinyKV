@@ -12,17 +12,23 @@ struct ClientOptions {
 };
 
 bool parse_port(const std::string& text, std::uint16_t& port_out) {
-    std::uint16_t port = 0;
+    if (text.empty())
+        return false;
+    std::uint32_t port = 0;
     for (int i = 0; i < text.size(); ++i) {
-        if (text[i] >= '0' && text[i] <= '9') {
-            port *= 10;
-            port += (text[i] - '0');
+        if (text[i] < '0' && text[i] > '9') {
+            return false;
         }
-        if (port < 1 || port > 65535) {
+        port *= 10;
+        port += (text[i] - '0');
+        if (port > 65535) {
             return false;
         }
     }
-    port_out = port;
+    if (port < 1) {
+        return false;
+    }
+    port_out = static_cast<std::uint16_t>(port);
     return true;
 }
 
@@ -43,8 +49,12 @@ bool parse_client_options(int argc, char* argv[], ClientOptions& options_out,
             }
             ++i;
             std::uint16_t port = 0;
-            if (parse_port(argv[i], port))
-                options_out.port = port;
+            if (!parse_port(argv[i], port))
+                return false;
+            options_out.port = port;
+            return true;
+        } else {
+            error_out = "Unkown option: " + std::string(argv[i]);
             return false;
         }
     }
@@ -54,8 +64,9 @@ bool parse_client_options(int argc, char* argv[], ClientOptions& options_out,
 int main(int argc, char* argv[]) {
     ClientOptions options;
     std::string error_out;
-    if(!parse_client_options(argc, argv, options, error_out)){
+    if (!parse_client_options(argc, argv, options, error_out)) {
         std::cerr << error_out;
+        return -1;
     }
     int cfd = connect_to_server(options.host, options.port);
     if (cfd < 0)
