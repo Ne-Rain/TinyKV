@@ -10,7 +10,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-int create_listen_socket(std::uint16_t port) {
+int create_listen_socket(const std::string& host, std::uint16_t port) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd == -1) {
         perror("socket");
@@ -19,7 +19,7 @@ int create_listen_socket(std::uint16_t port) {
     sockaddr_in saddr{};
     saddr.sin_family = AF_INET;
     saddr.sin_port = htons(port);
-    saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    inet_pton(AF_INET, host.c_str(), &saddr.sin_addr);
     int ret = bind(lfd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr));
     if (ret == -1) {
         perror("bind");

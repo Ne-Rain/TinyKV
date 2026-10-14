@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-int create_listen_socket(std::uint16_t port);
+int create_listen_socket(const std::string& host, std::uint16_t port);
 
 bool send_all(int fd, const std::string& data);
 
