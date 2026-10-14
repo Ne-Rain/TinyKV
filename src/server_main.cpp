@@ -62,7 +62,7 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out,
                 return false;
             }
             so.port = port;
-        } else if (strcmp(argv[i], "--model") == 0) {
+        } else if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
                 error_out = "Missing parameter value";
                 return false;
@@ -261,8 +261,10 @@ int main(int argc, char* argv[]) {
     // command_executor_test();
     ServerOptions so;
     std::string error;
-    if (parse_server_options(argc, argv, so, error)) {
-        run_blocking_server(so);
+    if (!parse_server_options(argc, argv, so, error)) {
+        std::cerr << error << std::endl;
+        return 1;
     }
+    run_blocking_server(so);
     return 0;
 }

@@ -19,7 +19,12 @@ int create_listen_socket(const std::string& host, std::uint16_t port) {
     sockaddr_in saddr{};
     saddr.sin_family = AF_INET;
     saddr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &saddr.sin_addr);
+    int res = inet_pton(AF_INET, host.c_str(), &saddr.sin_addr);
+    if (res != 1) {
+        std::fprintf(stderr, "Illegal IPv4: %s\n", host.c_str());
+        close(lfd);
+        return -1;
+    }
     int ret = bind(lfd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr));
     if (ret == -1) {
         perror("bind");
