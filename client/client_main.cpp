@@ -16,7 +16,7 @@ bool parse_port(const std::string& text, std::uint16_t& port_out) {
         return false;
     std::uint32_t port = 0;
     for (int i = 0; i < text.size(); ++i) {
-        if (text[i] < '0' && text[i] > '9') {
+        if (text[i] < '0' || text[i] > '9') {
             return false;
         }
         port *= 10;
@@ -49,10 +49,11 @@ bool parse_client_options(int argc, char* argv[], ClientOptions& options_out,
             }
             ++i;
             std::uint16_t port = 0;
-            if (!parse_port(argv[i], port))
+            if (!parse_port(argv[i], port)){
+                error_out = "The port must be a decimal integer ranging from 1 to 65535";
                 return false;
+            } 
             options_out.port = port;
-            return true;
         } else {
             error_out = "Unkown option: " + std::string(argv[i]);
             return false;
