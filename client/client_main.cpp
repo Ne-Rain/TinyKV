@@ -1,14 +1,63 @@
 #include "connection.hpp"
 #include "protocol.hpp"
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <unistd.h>
 
-int main() {
-    const std::string ip = "127.0.0.1";
+struct ClientOptions {
+    std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
-    int cfd = connect_to_server(ip, port);
+};
+
+bool parse_port(const std::string& text, std::uint16_t& port_out) {
+    std::uint16_t port = 0;
+    for (int i = 0; i < text.size(); ++i) {
+        if (text[i] >= '0' && text[i] <= '9') {
+            port *= 10;
+            port += (text[i] - '0');
+        }
+        if (port < 1 || port > 65535) {
+            return false;
+        }
+    }
+    port_out = port;
+    return true;
+}
+
+bool parse_client_options(int argc, char* argv[], ClientOptions& options_out,
+                          std::string& error_out) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--host") == 0) {
+            if (i + 1 >= argc) {
+                error_out = "Missing parameter value";
+                return false;
+            }
+            ++i;
+            options_out.host = argv[i];
+        } else if (strcmp(argv[i], "--port") == 0) {
+            if (i + 1 >= argc) {
+                error_out = "Missing parameter value";
+                return false;
+            }
+            ++i;
+            std::uint16_t port = 0;
+            if (parse_port(argv[i], port))
+                options_out.port = port;
+            return false;
+        }
+    }
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+    ClientOptions options;
+    std::string error_out;
+    if(!parse_client_options(argc, argv, options, error_out)){
+        std::cerr << error_out;
+    }
+    int cfd = connect_to_server(options.host, options.port);
     if (cfd < 0)
         return 1;
     std::string buffer;
@@ -22,7 +71,8 @@ int main() {
         if (line.empty())
             continue;
         if (line.size() > 8192) {
-            std::cout << "context size out of range";
+            std::cerr << "context size out of range";
+            continue;
         }
         std::string request = encode_frame(line);
         if (!send_all(cfd, request)) {
@@ -39,5 +89,5 @@ int main() {
         std::cout << response << '\n';
     }
     close(cfd);
-    return 0;
+    return exit_code;
 }
