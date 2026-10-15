@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 struct ServerOptions {
@@ -84,6 +85,33 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out,
     return true;
 }
 
+int run_blocking_server(const ServerOptions& options) {
+    int listen_fd = create_listen_socket(options.host, options.port);
+    if (listen_fd == -1) {
+        return -1;
+    }
+    KVStore store(1024 * 1024); // 1 MiB 的逻辑存储额度
+    while (true) {
+        sockaddr_in caddr{};
+        socklen_t len = sizeof(caddr);
+        int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+        if (client_fd == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+        char ip[32];
+        std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':'
+                  << ntohs(caddr.sin_port) << std::endl;
+        handle_client(client_fd, store);
+        close(client_fd);
+    }
+    close(listen_fd);
+    return 1;
+}
+
 int main(int argc, char* argv[]) {
     ServerOptions so;
     std::string error;
@@ -92,6 +120,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     int lfd = create_listen_socket(so.host, so.port);
+    set_nonblocking(lfd);
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     epoll_event event{};
     event.events = EPOLLIN;
@@ -99,24 +128,82 @@ int main(int argc, char* argv[]) {
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
 
     epoll_event events[16];
-    int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
-    for (int i = 0; i < n; ++i) {
-        int fd = events[i].data.fd;
-        if (fd == lfd && (events[i].events & EPOLLIN)) {
-            int cfd = accept(fd, nullptr, nullptr);
-            if (cfd >= 0) {
-                epoll_event event{};
-                event.events = EPOLLIN;
-                event.data.fd = fd;
-                epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event);
+    int flag = 0;
+    int cont = 0;
+    int exit_code = 0;
+    std::unordered_set<int> clients;
+    while (true) {
+        int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
+        if (n == -1) {
+            if (errno == EINTR) {
+                continue; // 这里继续外层 while，重新等待。
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            perror("epoll_wait");
+            exit_code = 1;
+            break;
+        }
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+            if (fd == lfd && (events[i].events & EPOLLIN)) {
+                for (int attempt = 0; attempt < 16; ++attempt) {
+                    int cfd = accept(fd, nullptr, nullptr);
+                    if (cfd >= 0) {
+                        if (!set_nonblocking(cfd)) {
+                            perror("set_nonblocking client");
+                            close(cfd);
+                            exit_code = 1;
+                            flag = 1;
+                            break;
+                        }
+                        ++cont;
+                        std::cout << "accepted #" << cont << ", client fd=" << cfd << std::endl;
+                        epoll_event client_event{};
+                        client_event.events = EPOLLIN | EPOLLRDHUP;
+                        client_event.data.fd = cfd;
+                        epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &client_event);
+                        clients.insert(cfd);
+                        break; // 每次监听事件接入一个客户端。
+                    } else {
+                        if (errno == EINTR) {
+                            continue;
+                        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        } else {
+                            perror("accept");
+                            exit_code = 1;
+                            flag = 1;
+                            break;
+                            break;
+                        }
+                    }
+                }
+            }
+            char buffer[1024];
+            ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+            if (received > 0) {
+                write(fd, buffer, received);
                 continue;
             } else {
+                if (received == 0) {
+                    std::cout << "client disconnected fd = " << fd << std::endl;
+                } else {
+                    if (errno == EAGAIN) {
+                        break;
+                    }
+                    perror("recv");
+                }
+                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                close(fd);
+                clients.erase(fd);
                 break;
             }
+            if (flag)
+                break;
         }
-        // 通信fd
+        if (flag)
+            break;
     }
-    return 0;
+    close(epfd);
+    close(lfd);
+    return exit_code;
 }
