@@ -135,7 +135,6 @@ int main(int argc, char* argv[]) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     epoll_event event{};
     event.events = EPOLLIN;
-    event.data.fd = lfd;
     event.data.u64 = 0;
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
 
@@ -159,7 +158,7 @@ int main(int argc, char* argv[]) {
             std::uint64_t id = events[i].data.u64;
             if (id == 0 && (events[i].events & EPOLLIN)) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
-                    int cfd = accept(events[i].data.fd, nullptr, nullptr);
+                    int cfd = accept(lfd, nullptr, nullptr);
                     if (cfd >= 0) {
                         if (!set_nonblocking(cfd)) {
                             perror("set_nonblocking client");
@@ -172,7 +171,6 @@ int main(int argc, char* argv[]) {
                         std::cout << "accepted #" << cont << ", client fd=" << cfd << std::endl;
                         epoll_event client_event{};
                         client_event.events = EPOLLIN | EPOLLRDHUP;
-                        client_event.data.fd = cfd;
                         std::uint64_t id = next_id++;
                         client_event.data.u64 = id;
                         int res = epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &client_event);
@@ -222,6 +220,7 @@ int main(int argc, char* argv[]) {
                 }
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
+                connections.erase(id);
                 break;
             }
             if (flag)
@@ -230,9 +229,10 @@ int main(int argc, char* argv[]) {
         if (flag)
             break;
     }
-    for(auto conn : connections){
+    for (auto& conn : connections) {
         close(conn.second.fd);
     }
+    connections.clear();
     close(epfd);
     close(lfd);
     return exit_code;
