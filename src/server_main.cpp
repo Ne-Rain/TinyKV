@@ -123,6 +123,22 @@ int run_blocking_server(const ServerOptions& options) {
     return 1;
 }
 
+bool process_input(Connection& conn) {
+    while (true) {
+        std::string payload;
+        ParseStatus status = try_decode_frame(conn.input, payload);
+        if (status == ParseStatus::FrameReady) {
+            std::cout << "id=" << conn.id << " " << payload << std::endl;
+            continue;
+        } else if (status == ParseStatus::NeedMore) {
+            return true;
+        } else {
+            std::cout << "ProtocolError" << std::endl;
+            return false;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     ServerOptions so;
     std::string error;
@@ -207,7 +223,14 @@ int main(int argc, char* argv[]) {
             ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
             if (received > 0) {
                 conn.input.append(buffer, static_cast<std::size_t>(received));
-                std::cout << "id=" << conn.id << " fd=" << conn.fd << " buffered=" << conn.input.size();
+                std::cout << "id=" << conn.id << " fd=" << conn.fd << " buffered=" << conn.input.size()
+                          << std::endl;
+                if (!process_input(conn)) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                    connections.erase(id);
+                    break;
+                }
                 continue;
             } else {
                 if (received == 0) {
