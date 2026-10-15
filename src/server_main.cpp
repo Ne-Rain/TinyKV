@@ -21,6 +21,18 @@ struct ServerOptions {
     std::string mode = "blocking";
 };
 
+struct Connection {
+    std::uint64_t id;
+    int fd;
+
+    std::string input;
+    std::string output;
+    std::size_t sent = 0;
+    bool read_closed = false;
+
+    Connection(std::uint64_t connection_id, int socket_fd) : id(connection_id), fd(socket_fd) {}
+};
+
 bool parse_port(const std::string& text, std::uint16_t& port_out) {
     if (text.empty())
         return false;
@@ -42,8 +54,7 @@ bool parse_port(const std::string& text, std::uint16_t& port_out) {
     return true;
 }
 
-bool parse_server_options(int argc, char* argv[], ServerOptions& options_out,
-                          std::string& error_out) {
+bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, std::string& error_out) {
     ServerOptions so{};
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--host") == 0) {
@@ -103,8 +114,8 @@ int run_blocking_server(const ServerOptions& options) {
             break;
         }
         char ip[32];
-        std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':'
-                  << ntohs(caddr.sin_port) << std::endl;
+        std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':' << ntohs(caddr.sin_port)
+                  << std::endl;
         handle_client(client_fd, store);
         close(client_fd);
     }
@@ -125,13 +136,15 @@ int main(int argc, char* argv[]) {
     epoll_event event{};
     event.events = EPOLLIN;
     event.data.fd = lfd;
+    event.data.u64 = 0;
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
 
     epoll_event events[16];
     int flag = 0;
     int cont = 0;
     int exit_code = 0;
-    std::unordered_set<int> clients;
+    std::uint64_t next_id = 1;
+    std::unordered_map<std::uint64_t, Connection> connections;
     while (true) {
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
         if (n == -1) {
@@ -143,10 +156,10 @@ int main(int argc, char* argv[]) {
             break;
         }
         for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-            if (fd == lfd && (events[i].events & EPOLLIN)) {
+            std::uint64_t id = events[i].data.u64;
+            if (id == 0 && (events[i].events & EPOLLIN)) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
-                    int cfd = accept(fd, nullptr, nullptr);
+                    int cfd = accept(events[i].data.fd, nullptr, nullptr);
                     if (cfd >= 0) {
                         if (!set_nonblocking(cfd)) {
                             perror("set_nonblocking client");
@@ -160,8 +173,15 @@ int main(int argc, char* argv[]) {
                         epoll_event client_event{};
                         client_event.events = EPOLLIN | EPOLLRDHUP;
                         client_event.data.fd = cfd;
-                        epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &client_event);
-                        clients.insert(cfd);
+                        std::uint64_t id = next_id++;
+                        client_event.data.u64 = id;
+                        int res = epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &client_event);
+                        if (res == -1) {
+                            perror("epoll_ctl ADD");
+                            close(cfd);
+                            continue;
+                        }
+                        connections.emplace(id, Connection(id, cfd));
                         break; // 每次监听事件接入一个客户端。
                     } else {
                         if (errno == EINTR) {
@@ -177,11 +197,19 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+                continue;
             }
+            auto it = connections.find(id);
+            if (it == connections.end()) {
+                continue; // 这条连接已经移除
+            }
+            Connection& conn = it->second;
+            int fd = conn.fd;
             char buffer[1024];
             ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
             if (received > 0) {
-                write(fd, buffer, received);
+                conn.input.append(buffer, static_cast<std::size_t>(received));
+                std::cout << "id=" << conn.id << " fd=" << conn.fd << " buffered=" << conn.input.size();
                 continue;
             } else {
                 if (received == 0) {
@@ -194,7 +222,6 @@ int main(int argc, char* argv[]) {
                 }
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
-                clients.erase(fd);
                 break;
             }
             if (flag)
@@ -202,6 +229,9 @@ int main(int argc, char* argv[]) {
         }
         if (flag)
             break;
+    }
+    for(auto conn : connections){
+        close(conn.second.fd);
     }
     close(epfd);
     close(lfd);
