@@ -123,12 +123,39 @@ int run_blocking_server(const ServerOptions& options) {
     return 1;
 }
 
-bool process_input(Connection& conn) {
+bool flush_output(Connection& conn) {
+    while (conn.sent < conn.output.size()) {
+        ssize_t sent =
+            send(conn.fd, conn.output.data() + conn.sent, conn.output.size() - conn.sent, MSG_NOSIGNAL);
+        if (sent > 0) {
+            conn.sent += static_cast<std::size_t>(sent);
+            continue;
+        } else if (sent == -1) {
+            if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    conn.output.clear();
+    conn.sent = 0;
+    return true;
+}
+
+bool process_input(Connection& conn, KVStore& store) {
     while (true) {
         std::string payload;
         ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
-            std::cout << "id=" << conn.id << " " << payload << std::endl;
+            std::string response = handle_payload(store, payload);
+            std::string frame = encode_frame(response);
+            conn.output.append(frame);
+            std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
             continue;
         } else if (status == ParseStatus::NeedMore) {
             return true;
@@ -140,7 +167,7 @@ bool process_input(Connection& conn) {
 }
 
 int main(int argc, char* argv[]) {
-    ServerOptions so;
+    ServerOptions so{};
     std::string error;
     if (!parse_server_options(argc, argv, so, error)) {
         std::cerr << error << std::endl;
@@ -160,6 +187,7 @@ int main(int argc, char* argv[]) {
     int exit_code = 0;
     std::uint64_t next_id = 1;
     std::unordered_map<std::uint64_t, Connection> connections;
+    KVStore store(1024 * 1024);
     while (true) {
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
         if (n == -1) {
@@ -225,12 +253,13 @@ int main(int argc, char* argv[]) {
                 conn.input.append(buffer, static_cast<std::size_t>(received));
                 std::cout << "id=" << conn.id << " fd=" << conn.fd << " buffered=" << conn.input.size()
                           << std::endl;
-                if (!process_input(conn)) {
+                if (!process_input(conn, store)) {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
                     connections.erase(id);
                     break;
                 }
+                flush_output(conn);
                 continue;
             } else {
                 if (received == 0) {
