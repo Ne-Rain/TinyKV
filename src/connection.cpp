@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -139,4 +140,15 @@ bool receive_frame(int fd, std::string& buffer, std::string& payload_out) {
             }
         }
     }
+}
+
+bool set_nonblocking(int fd) {
+    int flag = fcntl(fd, F_GETFL);
+    if(flag == -1)
+        return false;
+    flag |= O_NONBLOCK;
+    int res = fcntl(fd, F_SETFL, flag);
+    if(res == 0)
+        return true;
+    return false;
 }

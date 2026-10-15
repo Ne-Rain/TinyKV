@@ -12,3 +12,5 @@ void handle_client(int client_fd, KVStore& store);
 int connect_to_server(const std::string& ip, std::uint16_t port);
 
 bool receive_frame(int fd, std::string& buffer, std::string& payload_out);
+
+bool set_nonblocking(int fd);
