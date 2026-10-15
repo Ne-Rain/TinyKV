@@ -166,6 +166,18 @@ bool process_input(Connection& conn, KVStore& store) {
     }
 }
 
+bool update_interest(int epfd, const Connection& conn) {
+    epoll_event event{};
+    event.data.u64 = conn.id;
+    if (!conn.read_closed) {
+        event.events |= EPOLLIN | EPOLLRDHUP;
+    }
+    if (conn.sent < conn.output.size()) {
+        event.events |= EPOLLOUT;
+    }
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == 0;
+}
+
 int main(int argc, char* argv[]) {
     ServerOptions so{};
     std::string error;
@@ -248,32 +260,64 @@ int main(int argc, char* argv[]) {
             Connection& conn = it->second;
             int fd = conn.fd;
             char buffer[1024];
-            ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-            if (received > 0) {
-                conn.input.append(buffer, static_cast<std::size_t>(received));
-                std::cout << "id=" << conn.id << " fd=" << conn.fd << " buffered=" << conn.input.size()
-                          << std::endl;
-                if (!process_input(conn, store)) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
-                    connections.erase(id);
-                    break;
-                }
-                flush_output(conn);
-                continue;
-            } else {
-                if (received == 0) {
-                    std::cout << "client disconnected fd = " << fd << std::endl;
-                } else {
-                    if (errno == EAGAIN) {
-                        break;
+
+            std::uint32_t ready = events[i].events;
+            bool close_now = false;
+
+            // 1. 处理读取。
+            if (!conn.read_closed && (ready & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
+                char buffer[1024];
+                ssize_t received;
+
+                do {
+                    received = recv(fd, buffer, sizeof(buffer), 0);
+                } while (received == -1 && errno == EINTR);
+
+                if (received > 0) {
+                    conn.input.append(buffer, static_cast<std::size_t>(received));
+                    if (!process_input(conn, store)) {
+                        close_now = true; // 协议错误。
                     }
+                } else if (received == 0) {
+                    conn.read_closed = true;
+                    std::cout << "read EOF, fd=" << fd << std::endl;
+                    // 之前的完整帧已处理，剩余内容只能是不完整帧。
+                    if (!conn.input.empty()) {
+                        std::cout << "discard incomplete frame\n";
+                        conn.input.clear();
+                    }
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("recv");
+                    close_now = true;
                 }
+                // EAGAIN/EWOULDBLOCK：保留连接，继续后面的处理。
+            }
+
+            // 2. 处理发送。
+            if (!close_now && (ready & EPOLLOUT)) {
+                if (!flush_output(conn)) {
+                    close_now = true;
+                }
+            }
+
+            // 3. 已读到 EOF，并且响应全部发送完成。
+            if (!close_now && conn.read_closed && conn.sent == conn.output.size()) {
+                close_now = true;
+            }
+
+            // 4. 保留连接时，更新关注。
+            // 新生成的响应会让 update_interest 加入 EPOLLOUT。
+            if (!close_now && !update_interest(epfd, conn)) {
+                perror("epoll_ctl MOD");
+                close_now = true;
+            }
+
+            // 5. 统一关闭；此后不再使用 conn。
+            if (close_now) {
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
                 connections.erase(id);
-                break;
+                continue; // 处理下一个 events[i]。
             }
             if (flag)
                 break;
