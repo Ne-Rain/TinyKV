@@ -208,7 +208,7 @@ int main(int argc, char* argv[]) {
     KVStore store(1024 * 1024);
     while (true) {
         int timeout = runnable.empty() ? -1 : 0;
-        int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
+        int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), timeout);
         if (n == -1) {
             if (errno == EINTR) {
                 continue; // 这里继续外层 while，重新等待
@@ -266,7 +266,6 @@ int main(int argc, char* argv[]) {
             }
             Connection& conn = it->second;
             int fd = conn.fd;
-            conn.queued = false;
 
             std::uint32_t ready = events[i].events;
             bool close_now = false;
@@ -286,22 +285,16 @@ int main(int argc, char* argv[]) {
                         runnable.push_back(conn.id);
                         conn.queued = true;
                     }
-                    if (process_input(conn, store, max_frames) == ProcessResult::ProtocolError) {
-                        close_now = true; // 协议错误。
-                    }
                 } else if (received == 0) {
                     conn.read_closed = true;
-                    std::cout << "read EOF, fd=" << fd << std::endl;
-                    // 之前的完整帧已处理，剩余内容只能是不完整帧。
-                    if (!conn.input.empty()) {
-                        std::cout << "discard incomplete frame\n";
-                        conn.input.clear();
+                    if (!conn.queued) {
+                        runnable.push_back(conn.id);
+                        conn.queued = true;
                     }
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("recv");
                     close_now = true;
                 }
-                // EAGAIN/EWOULDBLOCK：保留连接，继续后面的处理。
             }
 
             // 2. 处理发送。
@@ -312,7 +305,8 @@ int main(int argc, char* argv[]) {
             }
 
             // 3. 已读到 EOF，并且响应全部发送完成。
-            if (!close_now && conn.read_closed && conn.sent == conn.output.size()) {
+            if (!close_now && conn.read_closed && conn.sent == conn.output.size() && !conn.queued &&
+                conn.input.empty()) {
                 close_now = true;
             }
 
@@ -343,12 +337,39 @@ int main(int argc, char* argv[]) {
             if (it == connections.end()) {
                 continue;
             }
-            it->second.queued = false;
-            auto result = process_input(it->second, store, max_frames);
-            if(result == ProcessResult::BudgetExhausted){
-                runnable.push_back(task_id);
-                it->second.queued = true;
-            }else if(result == ProcessResult::NeedMore){
+            Connection& conn = it->second;
+            conn.queued = false;
+            bool close_now = false;
+            auto result = process_input(conn, store, max_frames);
+            if (result == ProcessResult::BudgetExhausted) {
+                if (!conn.queued) {
+                    runnable.push_back(conn.id);
+                    conn.queued = true;
+                }
+            } else if (result == ProcessResult::NeedMore) {
+                // 所有完整帧已经处理完。
+                if (conn.read_closed && !conn.input.empty()) {
+                    // 已经 EOF，残留半帧不可能再补齐。
+                    std::cout << "discard incomplete frame, id=" << conn.id << std::endl;
+                    conn.input.clear();
+                }
+            } else {
+                close_now = true;
+            }
+
+            if (!close_now && !update_interest(epfd, conn)) {
+                perror("epoll_ctl MOD");
+                close_now = true;
+            }
+
+            if (close_now) {
+                int fd = conn.fd;
+                if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+                    perror("epoll_ctl DEL");
+                }
+                close(fd);
+                connections.erase(it);
+                // conn 已失效，不再访问。
                 continue;
             }
         }
