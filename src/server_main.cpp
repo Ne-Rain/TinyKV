@@ -12,9 +12,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <unordered_set>
-#include <vector>
+#include <deque>
 
+enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError };
 struct ServerOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
@@ -29,6 +29,7 @@ struct Connection {
     std::string output;
     std::size_t sent = 0;
     bool read_closed = false;
+    bool queued = false;
 
     Connection(std::uint64_t connection_id, int socket_fd) : id(connection_id), fd(socket_fd) {}
 };
@@ -147,23 +148,25 @@ bool flush_output(Connection& conn) {
     return true;
 }
 
-bool process_input(Connection& conn, KVStore& store) {
-    while (true) {
+ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames) {
+    while (max_frames) {
         std::string payload;
-        ParseStatus status = try_decode_frame(conn.input, payload);
+        ParseStatus status = try_decode_frame(conn.input, payload); 
         if (status == ParseStatus::FrameReady) {
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
             conn.output.append(frame);
             std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
+            max_frames--;
             continue;
         } else if (status == ParseStatus::NeedMore) {
-            return true;
+            return ProcessResult::NeedMore;
         } else {
             std::cout << "ProtocolError" << std::endl;
-            return false;
+            return ProcessResult::ProtocolError;
         }
     }
+    return ProcessResult::BudgetExhausted;
 }
 
 bool update_interest(int epfd, const Connection& conn) {
@@ -199,6 +202,8 @@ int main(int argc, char* argv[]) {
     int exit_code = 0;
     std::uint64_t next_id = 1;
     std::unordered_map<std::uint64_t, Connection> connections;
+    std::deque<std::uint64_t> runnable;
+    std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
     while (true) {
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
@@ -253,13 +258,15 @@ int main(int argc, char* argv[]) {
                 }
                 continue;
             }
+            id = runnable.front();
+            runnable.pop_front();
             auto it = connections.find(id);
             if (it == connections.end()) {
                 continue; // 这条连接已经移除
             }
             Connection& conn = it->second;
             int fd = conn.fd;
-            char buffer[1024];
+            conn.queued = false;
 
             std::uint32_t ready = events[i].events;
             bool close_now = false;
@@ -275,8 +282,16 @@ int main(int argc, char* argv[]) {
 
                 if (received > 0) {
                     conn.input.append(buffer, static_cast<std::size_t>(received));
-                    if (!process_input(conn, store)) {
+                    if(!conn.queued){
+                        runnable.push_back(conn.id);
+                        conn.queued = true;
+                    }
+                    ProcessResult result = process_input(conn, store, max_frames);
+                    if (result == ProcessResult::ProtocolError) {
                         close_now = true; // 协议错误。
+                    } else if(result == ProcessResult::BudgetExhausted){
+                        runnable.push_back(conn.id);
+                        conn.queued = true;
                     }
                 } else if (received == 0) {
                     conn.read_closed = true;
