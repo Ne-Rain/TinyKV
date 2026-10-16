@@ -125,12 +125,14 @@ int run_blocking_server(const ServerOptions& options) {
     return 1;
 }
 
-bool flush_output(Connection& conn) {
-    while (conn.sent < conn.output.size()) {
-        ssize_t sent =
-            send(conn.fd, conn.output.data() + conn.sent, conn.output.size() - conn.sent, MSG_NOSIGNAL);
+bool flush_output(Connection& conn, std::size_t max_bytes) {
+    std::size_t remaining_budget = max_bytes;
+    while (conn.sent < conn.output.size() && remaining_budget > 0) {
+        std::size_t cout = std::min(conn.output.size() - conn.sent, remaining_budget);
+        ssize_t sent = send(conn.fd, conn.output.data() + conn.sent, cout, MSG_NOSIGNAL);
         if (sent > 0) {
             conn.sent += static_cast<std::size_t>(sent);
+            remaining_budget -= static_cast<std::size_t>(sent);
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
@@ -144,8 +146,10 @@ bool flush_output(Connection& conn) {
             return false;
         }
     }
-    conn.output.clear();
-    conn.sent = 0;
+    if (conn.sent == conn.output.size()) {
+        conn.output.clear();
+        conn.sent = 0;
+    }
     return true;
 }
 
@@ -299,7 +303,7 @@ int main(int argc, char* argv[]) {
 
             // 2. 处理发送。
             if (!close_now && (ready & EPOLLOUT)) {
-                if (!flush_output(conn)) {
+                if (!flush_output(conn, 64 * 1024)) {
                     close_now = true;
                 }
             }
@@ -354,6 +358,11 @@ int main(int argc, char* argv[]) {
                     conn.input.clear();
                 }
             } else {
+                close_now = true;
+            }
+
+            if (!close_now && conn.read_closed && !conn.queued && conn.input.empty() &&
+                conn.sent == conn.output.size()) {
                 close_now = true;
             }
 
