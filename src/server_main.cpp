@@ -2,9 +2,11 @@
 #include "connection.hpp"
 #include "kv_store.hpp"
 #include "protocol.hpp"
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <deque>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
@@ -12,7 +14,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <deque>
 
 enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError };
 struct ServerOptions {
@@ -151,7 +152,7 @@ bool flush_output(Connection& conn) {
 ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames) {
     while (max_frames) {
         std::string payload;
-        ParseStatus status = try_decode_frame(conn.input, payload); 
+        ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
@@ -206,10 +207,11 @@ int main(int argc, char* argv[]) {
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
     while (true) {
+        int timeout = runnable.empty() ? -1 : 0;
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
         if (n == -1) {
             if (errno == EINTR) {
-                continue; // 这里继续外层 while，重新等待。
+                continue; // 这里继续外层 while，重新等待
             }
             perror("epoll_wait");
             exit_code = 1;
@@ -258,8 +260,6 @@ int main(int argc, char* argv[]) {
                 }
                 continue;
             }
-            id = runnable.front();
-            runnable.pop_front();
             auto it = connections.find(id);
             if (it == connections.end()) {
                 continue; // 这条连接已经移除
@@ -282,16 +282,12 @@ int main(int argc, char* argv[]) {
 
                 if (received > 0) {
                     conn.input.append(buffer, static_cast<std::size_t>(received));
-                    if(!conn.queued){
+                    if (!conn.queued) {
                         runnable.push_back(conn.id);
                         conn.queued = true;
                     }
-                    ProcessResult result = process_input(conn, store, max_frames);
-                    if (result == ProcessResult::ProtocolError) {
+                    if (process_input(conn, store, max_frames) == ProcessResult::ProtocolError) {
                         close_now = true; // 协议错误。
-                    } else if(result == ProcessResult::BudgetExhausted){
-                        runnable.push_back(conn.id);
-                        conn.queued = true;
                     }
                 } else if (received == 0) {
                     conn.read_closed = true;
@@ -339,6 +335,23 @@ int main(int argc, char* argv[]) {
         }
         if (flag)
             break;
+        std::size_t turns = std::min<std::size_t>(runnable.size(), 32);
+        for (std::size_t turn = 0; turn < turns; ++turn) {
+            std::uint64_t task_id = runnable.front();
+            runnable.pop_front();
+            auto it = connections.find(task_id);
+            if (it == connections.end()) {
+                continue;
+            }
+            it->second.queued = false;
+            auto result = process_input(it->second, store, max_frames);
+            if(result == ProcessResult::BudgetExhausted){
+                runnable.push_back(task_id);
+                it->second.queued = true;
+            }else if(result == ProcessResult::NeedMore){
+                continue;
+            }
+        }
     }
     for (auto& conn : connections) {
         close(conn.second.fd);
