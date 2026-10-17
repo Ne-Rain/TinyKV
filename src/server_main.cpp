@@ -84,8 +84,8 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
                 return false;
             }
             ++i;
-            if (strcmp(argv[i], "blocking") != 0) {
-                error_out = "parameter value error";
+            if (strcmp(argv[i], "blocking") != 0 && strcmp(argv[i], "reactor") != 0) {
+                error_out = "Unsupported mode: " + std::string(argv[i]);
                 return false;
             }
             so.mode = argv[i];
@@ -96,33 +96,6 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
     }
     options_out = so;
     return true;
-}
-
-int run_blocking_server(const ServerOptions& options) {
-    int listen_fd = create_listen_socket(options.host, options.port);
-    if (listen_fd == -1) {
-        return -1;
-    }
-    KVStore store(1024 * 1024); // 1 MiB 的逻辑存储额度
-    while (true) {
-        sockaddr_in caddr{};
-        socklen_t len = sizeof(caddr);
-        int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &len);
-        if (client_fd == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;
-        }
-        char ip[32];
-        std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':' << ntohs(caddr.sin_port)
-                  << std::endl;
-        handle_client(client_fd, store);
-        close(client_fd);
-    }
-    close(listen_fd);
-    return 1;
 }
 
 bool flush_output(Connection& conn, std::size_t max_bytes) {
@@ -175,6 +148,7 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
 }
 
 bool update_interest(int epfd, const Connection& conn) {
+
     epoll_event event{};
     event.data.u64 = conn.id;
     if (!conn.read_closed) {
@@ -186,20 +160,56 @@ bool update_interest(int epfd, const Connection& conn) {
     return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == 0;
 }
 
-int main(int argc, char* argv[]) {
-    ServerOptions so{};
-    std::string error;
-    if (!parse_server_options(argc, argv, so, error)) {
-        std::cerr << error << std::endl;
+int run_blocking_server(const ServerOptions& options) {
+    int listen_fd = create_listen_socket(options.host, options.port);
+    if (listen_fd == -1) {
+        return -1;
+    }
+    KVStore store(1024 * 1024); // 1 MiB 的逻辑存储额度
+    while (true) {
+        sockaddr_in caddr{};
+        socklen_t len = sizeof(caddr);
+        int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+        if (client_fd == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+        char ip[32];
+        std::cout << inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip)) << ':' << ntohs(caddr.sin_port)
+                  << std::endl;
+        handle_client(client_fd, store);
+        close(client_fd);
+    }
+    close(listen_fd);
+    return 1;
+}
+
+int run_reactor_server(const ServerOptions& so) {
+    int lfd = create_listen_socket(so.host, so.port);
+    if (lfd == -1) {
+        return -1;
+    }
+    if (set_nonblocking(lfd) == false) {
+        close(lfd);
         return 1;
     }
-    int lfd = create_listen_socket(so.host, so.port);
-    set_nonblocking(lfd);
     int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        close(lfd);
+        return 1;
+    }
     epoll_event event{};
     event.events = EPOLLIN;
     event.data.u64 = 0;
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
+    if (res == -1) {
+        close(epfd);
+        close(lfd);
+        return 1;
+    }
 
     epoll_event events[16];
     int flag = 0;
@@ -390,4 +400,25 @@ int main(int argc, char* argv[]) {
     close(epfd);
     close(lfd);
     return exit_code;
+}
+
+int main(int argc, char* argv[]) {
+    ServerOptions so{};
+    std::string error;
+
+    if (!parse_server_options(argc, argv, so, error)) {
+        std::cerr << error << std::endl;
+        return 1;
+    }
+
+    if (so.mode == "blocking") {
+        return run_blocking_server(so);
+    }
+
+    if (so.mode == "reactor") {
+        return run_reactor_server(so);
+    }
+
+    std::cerr << "Unsupported mode: " << so.mode << std::endl;
+    return 1;
 }
