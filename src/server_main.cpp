@@ -15,7 +15,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError };
+enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError, OutputLimit };
 struct ServerOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
@@ -129,10 +129,14 @@ bool flush_output(Connection& conn, std::size_t max_bytes) {
 ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames) {
     while (max_frames) {
         std::string payload;
+        std::size_t max_send_bytes = 64 * 1024;
         ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
+            if (max_send_bytes < conn.output.size() - frame.size()) {
+                return ProcessResult::OutputLimit;
+            }
             conn.output.append(frame);
             std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
             max_frames--;
@@ -311,16 +315,21 @@ int run_reactor_server(const ServerOptions& so) {
             if (!conn.read_closed && (ready & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
                 char buffer[1024];
                 ssize_t received;
+                std::size_t max_received_bytes = 64 * 1024; // 单次最大接收
 
                 do {
                     received = recv(fd, buffer, sizeof(buffer), 0);
                 } while (received == -1 && errno == EINTR);
 
                 if (received > 0) {
-                    conn.input.append(buffer, static_cast<std::size_t>(received));
-                    if (!conn.queued) {
-                        runnable.push_back(conn.id);
-                        conn.queued = true;
+                    if (received > max_received_bytes - conn.input.size()) {
+                        close_now = true;
+                    } else {
+                        conn.input.append(buffer, static_cast<std::size_t>(received));
+                        if (!conn.queued) {
+                            runnable.push_back(conn.id);
+                            conn.queued = true;
+                        }
                     }
                 } else if (received == 0) {
                     conn.read_closed = true;
@@ -409,7 +418,7 @@ int run_reactor_server(const ServerOptions& so) {
             }
         }
     }
-    while(!connections.empty()){
+    while (!connections.empty()) {
         auto id = connections.begin()->first;
         close_connection(epfd, connections, id);
     }
