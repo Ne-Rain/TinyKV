@@ -160,6 +160,21 @@ bool update_interest(int epfd, const Connection& conn) {
     return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == 0;
 }
 
+void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections,
+                      std::uint64_t id) {
+
+    auto it = connections.find(id);
+    if (it == connections.end()) {
+        return;
+    }
+    int fd = it->second.fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+        perror("epoll_ctl DEL");
+    }
+    close(fd);
+    connections.erase(it);
+}
+
 int run_blocking_server(const ServerOptions& options) {
     int listen_fd = create_listen_socket(options.host, options.port);
     if (listen_fd == -1) {
@@ -188,16 +203,19 @@ int run_blocking_server(const ServerOptions& options) {
 }
 
 int run_reactor_server(const ServerOptions& so) {
+    const std::size_t max_connections = 128;
     int lfd = create_listen_socket(so.host, so.port);
     if (lfd == -1) {
         return -1;
     }
     if (set_nonblocking(lfd) == false) {
+        perror("set_nonblocking listen");
         close(lfd);
         return 1;
     }
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
+        perror("epoll_create1");
         close(lfd);
         return 1;
     }
@@ -206,6 +224,7 @@ int run_reactor_server(const ServerOptions& so) {
     event.data.u64 = 0;
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
     if (res == -1) {
+        perror("epoll_ctl ADD listen");
         close(epfd);
         close(lfd);
         return 1;
@@ -237,6 +256,10 @@ int run_reactor_server(const ServerOptions& so) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
                     int cfd = accept(lfd, nullptr, nullptr);
                     if (cfd >= 0) {
+                        if (connections.size() >= max_connections) {
+                            close(cfd);
+                            continue;
+                        }
                         if (!set_nonblocking(cfd)) {
                             perror("set_nonblocking client");
                             close(cfd);
@@ -333,9 +356,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             // 5. 统一关闭；此后不再使用 conn。
             if (close_now) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                close(fd);
-                connections.erase(id);
+                close_connection(epfd, connections, conn.id);
                 continue; // 处理下一个 events[i]。
             }
             if (flag)
@@ -382,19 +403,15 @@ int run_reactor_server(const ServerOptions& so) {
             }
 
             if (close_now) {
-                int fd = conn.fd;
-                if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-                    perror("epoll_ctl DEL");
-                }
-                close(fd);
-                connections.erase(it);
+                close_connection(epfd, connections, task_id);
                 // conn 已失效，不再访问。
                 continue;
             }
         }
     }
-    for (auto& conn : connections) {
-        close(conn.second.fd);
+    while(!connections.empty()){
+        auto id = connections.begin()->first;
+        close_connection(epfd, connections, id);
     }
     connections.clear();
     close(epfd);
