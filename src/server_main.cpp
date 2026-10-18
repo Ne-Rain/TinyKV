@@ -101,12 +101,11 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
 bool flush_output(Connection& conn, std::size_t max_bytes) {
     std::size_t remaining_budget = max_bytes;
     while (conn.sent < conn.output.size() && remaining_budget > 0) {
-        std::size_t cout = std::min(conn.output.size(), remaining_budget);
-        ssize_t sent = send(conn.fd, conn.output.data(), cout, MSG_NOSIGNAL);
+        std::size_t cout = std::min(conn.output.size() - conn.sent, remaining_budget);
+        ssize_t sent = send(conn.fd, conn.output.data() + conn.sent, cout, MSG_NOSIGNAL);
         if (sent > 0) {
             conn.sent += static_cast<std::size_t>(sent);
             remaining_budget -= static_cast<std::size_t>(sent);
-            conn.output.erase(0, sent);
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
@@ -128,19 +127,29 @@ bool flush_output(Connection& conn, std::size_t max_bytes) {
 }
 
 ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames) {
-    while (max_frames) {
+    std::size_t max_send_bytes = 64 * 1024;
+    while (max_frames > 0) {
         std::string payload;
-        std::size_t max_send_bytes = 64 * 1024;
         ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
+            if (conn.sent > 0) {
+                conn.output.erase(0, conn.sent);
+                conn.sent = 0;
+            }
+            std::size_t pending = conn.output.size();
+            if (pending > max_send_bytes || frame.size() > max_send_bytes - pending) {
+                std::cerr << "output limit exceeded, id=" << conn.id << ", pending=" << pending
+                          << ", frame=" << frame.size() << ", limit=" << max_send_bytes << '\n';
+                return ProcessResult::OutputLimit;
+            }
             if (max_send_bytes < conn.output.size() - frame.size()) {
                 return ProcessResult::OutputLimit;
             }
             conn.output.append(frame);
             std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
-            max_frames--;
+            --max_frames;
             continue;
         } else if (status == ParseStatus::NeedMore) {
             return ProcessResult::NeedMore;
