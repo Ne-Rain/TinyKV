@@ -101,11 +101,12 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
 bool flush_output(Connection& conn, std::size_t max_bytes) {
     std::size_t remaining_budget = max_bytes;
     while (conn.sent < conn.output.size() && remaining_budget > 0) {
-        std::size_t cout = std::min(conn.output.size() - conn.sent, remaining_budget);
-        ssize_t sent = send(conn.fd, conn.output.data() + conn.sent, cout, MSG_NOSIGNAL);
+        std::size_t cout = std::min(conn.output.size(), remaining_budget);
+        ssize_t sent = send(conn.fd, conn.output.data(), cout, MSG_NOSIGNAL);
         if (sent > 0) {
             conn.sent += static_cast<std::size_t>(sent);
             remaining_budget -= static_cast<std::size_t>(sent);
+            conn.output.erase(0, sent);
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
