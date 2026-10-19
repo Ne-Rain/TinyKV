@@ -275,13 +275,8 @@ int run_reactor_server(const ServerOptions& so) {
     std::deque<std::uint64_t> runnable;
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
-
-    auto wait_time = std::chrono::steady_clock::now();
     while (true) {
-        int timeout = runnable.empty() ? -1 : 0;
-        if(std::chrono::steady_clock::now() - wait_time > std::chrono::milliseconds(200)){
-            timeout = 0;
-        }
+        int timeout = runnable.empty() ? 200 : 0;
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), timeout);
         if (n == -1) {
             if (errno == EINTR) {
