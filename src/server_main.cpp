@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
+#include <ctime>
 #include <deque>
 #include <iostream>
 #include <netinet/in.h>
@@ -14,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
 
 enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError, OutputLimit };
 struct ServerOptions {
@@ -25,6 +28,7 @@ struct ServerOptions {
 struct Connection {
     std::uint64_t id;
     int fd;
+    std::chrono::steady_clock::time_point last_activity;
 
     std::string input;
     std::string output;
@@ -32,7 +36,9 @@ struct Connection {
     bool read_closed = false;
     bool queued = false;
 
-    Connection(std::uint64_t connection_id, int socket_fd) : id(connection_id), fd(socket_fd) {}
+    Connection(std::uint64_t connection_id, int socket_fd,
+               std::chrono::steady_clock::time_point last_activity_time)
+        : id(connection_id), fd(socket_fd), last_activity(last_activity_time) {}
 };
 
 struct Budget_Bytes {
@@ -113,6 +119,7 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
             conn.sent += static_cast<std::size_t>(sent);
             remaining_budget -= static_cast<std::size_t>(sent);
             budb.used_bytes -= sent;
+            conn.last_activity = std::chrono::steady_clock::now();
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
@@ -143,7 +150,7 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             budb.used_bytes -= (before_decode_size - conn.input.size());
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
-            if(frame.size() > budb.limit_bytes - budb.used_bytes){
+            if (frame.size() > budb.limit_bytes - budb.used_bytes) {
                 std::cerr << "litmit_bytes exceeded, id=" << conn.id << "\n";
                 return ProcessResult::OutputLimit;
             }
@@ -186,8 +193,8 @@ bool update_interest(int epfd, const Connection& conn) {
     return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == 0;
 }
 
-void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections,
-                      std::uint64_t id, Budget_Bytes& budb) {
+void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections, std::uint64_t id,
+                      Budget_Bytes& budb) {
 
     auto it = connections.find(id);
     if (it == connections.end()) {
@@ -297,6 +304,7 @@ int run_reactor_server(const ServerOptions& so) {
                             break;
                         }
                         ++cont;
+
                         std::cout << "accepted #" << cont << ", client fd=" << cfd << std::endl;
                         epoll_event client_event{};
                         client_event.events = EPOLLIN | EPOLLRDHUP;
@@ -308,7 +316,7 @@ int run_reactor_server(const ServerOptions& so) {
                             close(cfd);
                             continue;
                         }
-                        connections.emplace(id, Connection(id, cfd));
+                        connections.emplace(id, Connection(id, cfd, std::chrono::steady_clock::now()));
                         break; // 每次监听事件接入一个客户端。
                     } else {
                         if (errno == EINTR) {
@@ -351,6 +359,7 @@ int run_reactor_server(const ServerOptions& so) {
                         received > budb.limit_bytes - budb.used_bytes) {
                         close_now = true;
                     } else {
+                        conn.last_activity = std::chrono::steady_clock::now();
                         conn.input.append(buffer, static_cast<std::size_t>(received));
                         budb.used_bytes += received;
                         budb.peak_bytes = std::max(budb.peak_bytes, budb.used_bytes);
@@ -445,6 +454,16 @@ int run_reactor_server(const ServerOptions& so) {
                 // conn 已失效，不再访问。
                 continue;
             }
+        }
+        auto time_now = std::chrono::steady_clock::now();
+        std::vector<std::uint64_t> timeout_id;
+        for(auto it = connections.begin();it != connections.end();++it){
+            if(time_now - it->second.last_activity > std::chrono::milliseconds(200)){
+                timeout_id.push_back(it->first);
+            }
+        }
+        for(auto& t : timeout_id){
+            close_connection(epfd, connections, t, budb);
         }
     }
     while (!connections.empty()) {
