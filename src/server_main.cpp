@@ -35,6 +35,12 @@ struct Connection {
     Connection(std::uint64_t connection_id, int socket_fd) : id(connection_id), fd(socket_fd) {}
 };
 
+struct Budget_Bytes {
+    const std::size_t limit_bytes = 64 * 1024 * 1024; // 全局总上限
+    std::size_t used_bytes = 0;                       // 当前已经占用的字节
+    std::size_t peak_bytes = 0;                       // 已占用字节历史峰值
+};
+
 bool parse_port(const std::string& text, std::uint16_t& port_out) {
     if (text.empty())
         return false;
@@ -98,7 +104,7 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
     return true;
 }
 
-bool flush_output(Connection& conn, std::size_t max_bytes) {
+bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
     std::size_t remaining_budget = max_bytes;
     while (conn.sent < conn.output.size() && remaining_budget > 0) {
         std::size_t cout = std::min(conn.output.size() - conn.sent, remaining_budget);
@@ -106,6 +112,7 @@ bool flush_output(Connection& conn, std::size_t max_bytes) {
         if (sent > 0) {
             conn.sent += static_cast<std::size_t>(sent);
             remaining_budget -= static_cast<std::size_t>(sent);
+            budb.used_bytes -= sent;
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
@@ -126,12 +133,13 @@ bool flush_output(Connection& conn, std::size_t max_bytes) {
     return true;
 }
 
-ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames) {
+ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames, Budget_Bytes& budb) {
     std::size_t max_send_bytes = 64 * 1024;
     while (max_frames > 0) {
         std::string payload;
         ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
+            budb.used_bytes -= payload.size();
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
             if (conn.sent > 0) {
@@ -142,9 +150,6 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             if (pending > max_send_bytes || frame.size() > max_send_bytes - pending) {
                 std::cerr << "output limit exceeded, id=" << conn.id << ", pending=" << pending
                           << ", frame=" << frame.size() << ", limit=" << max_send_bytes << '\n';
-                return ProcessResult::OutputLimit;
-            }
-            if (max_send_bytes < conn.output.size() - frame.size()) {
                 return ProcessResult::OutputLimit;
             }
             conn.output.append(frame);
@@ -218,6 +223,7 @@ int run_blocking_server(const ServerOptions& options) {
 
 int run_reactor_server(const ServerOptions& so) {
     const std::size_t max_connections = 128;
+    Budget_Bytes budb;
     int lfd = create_listen_socket(so.host, so.port);
     if (lfd == -1) {
         return -1;
@@ -332,10 +338,13 @@ int run_reactor_server(const ServerOptions& so) {
                 } while (received == -1 && errno == EINTR);
 
                 if (received > 0) {
-                    if (received > max_received_bytes - conn.input.size()) {
+                    if (received > max_received_bytes - conn.input.size() &&
+                        received < budb.limit_bytes - budb.used_bytes) {
                         close_now = true;
                     } else {
                         conn.input.append(buffer, static_cast<std::size_t>(received));
+                        budb.used_bytes += received;
+                        budb.peak_bytes = std::max(budb.peak_bytes, budb.used_bytes);
                         if (!conn.queued) {
                             runnable.push_back(conn.id);
                             conn.queued = true;
@@ -355,7 +364,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             // 2. 处理发送。
             if (!close_now && (ready & EPOLLOUT)) {
-                if (!flush_output(conn, 64 * 1024)) {
+                if (!flush_output(conn, 64 * 1024, budb)) {
                     close_now = true;
                 }
             }
@@ -394,7 +403,7 @@ int run_reactor_server(const ServerOptions& so) {
             Connection& conn = it->second;
             conn.queued = false;
             bool close_now = false;
-            auto result = process_input(conn, store, max_frames);
+            auto result = process_input(conn, store, max_frames, budb);
             if (result == ProcessResult::BudgetExhausted) {
                 if (!conn.queued) {
                     runnable.push_back(conn.id);
