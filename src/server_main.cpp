@@ -142,6 +142,11 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             budb.used_bytes -= payload.size();
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
+            if(frame.size() > budb.limit_bytes - budb.used_bytes){
+                std::cerr << "litmit_bytes exceeded" << "\n";
+                return ProcessResult::OutputLimit;
+            }
+            budb.used_bytes += frame.size();
             if (conn.sent > 0) {
                 conn.output.erase(0, conn.sent);
                 conn.sent = 0;
@@ -180,7 +185,7 @@ bool update_interest(int epfd, const Connection& conn) {
 }
 
 void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections,
-                      std::uint64_t id) {
+                      std::uint64_t id, Budget_Bytes& budb) {
 
     auto it = connections.find(id);
     if (it == connections.end()) {
@@ -190,6 +195,8 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
         perror("epoll_ctl DEL");
     }
+    budb.used_bytes -= it->second.input.size();
+    budb.used_bytes -= it->second.output.size();
     close(fd);
     connections.erase(it);
 }
@@ -338,8 +345,8 @@ int run_reactor_server(const ServerOptions& so) {
                 } while (received == -1 && errno == EINTR);
 
                 if (received > 0) {
-                    if (received > max_received_bytes - conn.input.size() &&
-                        received < budb.limit_bytes - budb.used_bytes) {
+                    if (received > max_received_bytes - conn.input.size() ||
+                        received > budb.limit_bytes - budb.used_bytes) {
                         close_now = true;
                     } else {
                         conn.input.append(buffer, static_cast<std::size_t>(received));
@@ -384,7 +391,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             // 5. 统一关闭；此后不再使用 conn。
             if (close_now) {
-                close_connection(epfd, connections, conn.id);
+                close_connection(epfd, connections, conn.id, budb);
                 continue; // 处理下一个 events[i]。
             }
             if (flag)
@@ -413,6 +420,7 @@ int run_reactor_server(const ServerOptions& so) {
                 // 所有完整帧已经处理完。
                 if (conn.read_closed && !conn.input.empty()) {
                     // 已经 EOF，残留半帧不可能再补齐。
+                    budb.used_bytes -= conn.input.size();
                     std::cout << "discard incomplete frame, id=" << conn.id << std::endl;
                     conn.input.clear();
                 }
@@ -431,7 +439,7 @@ int run_reactor_server(const ServerOptions& so) {
             }
 
             if (close_now) {
-                close_connection(epfd, connections, task_id);
+                close_connection(epfd, connections, task_id, budb);
                 // conn 已失效，不再访问。
                 continue;
             }
@@ -439,7 +447,7 @@ int run_reactor_server(const ServerOptions& so) {
     }
     while (!connections.empty()) {
         auto id = connections.begin()->first;
-        close_connection(epfd, connections, id);
+        close_connection(epfd, connections, id, budb);
     }
     connections.clear();
     close(epfd);
