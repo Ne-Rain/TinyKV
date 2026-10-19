@@ -137,16 +137,16 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
     std::size_t max_send_bytes = 64 * 1024;
     while (max_frames > 0) {
         std::string payload;
+        std::size_t before_decode_size = conn.input.size();
         ParseStatus status = try_decode_frame(conn.input, payload);
         if (status == ParseStatus::FrameReady) {
-            budb.used_bytes -= payload.size();
+            budb.used_bytes -= (before_decode_size - conn.input.size());
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
             if(frame.size() > budb.limit_bytes - budb.used_bytes){
-                std::cerr << "litmit_bytes exceeded" << "\n";
+                std::cerr << "litmit_bytes exceeded, id=" << conn.id << "\n";
                 return ProcessResult::OutputLimit;
             }
-            budb.used_bytes += frame.size();
             if (conn.sent > 0) {
                 conn.output.erase(0, conn.sent);
                 conn.sent = 0;
@@ -158,6 +158,8 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
                 return ProcessResult::OutputLimit;
             }
             conn.output.append(frame);
+            budb.used_bytes += frame.size();
+            budb.peak_bytes = std::max(budb.used_bytes, budb.peak_bytes);
             std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
             --max_frames;
             continue;
@@ -196,7 +198,7 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
         perror("epoll_ctl DEL");
     }
     budb.used_bytes -= it->second.input.size();
-    budb.used_bytes -= it->second.output.size();
+    budb.used_bytes -= (it->second.output.size() - it->second.sent);
     close(fd);
     connections.erase(it);
 }
