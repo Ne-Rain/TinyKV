@@ -275,8 +275,13 @@ int run_reactor_server(const ServerOptions& so) {
     std::deque<std::uint64_t> runnable;
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
+
+    auto wait_time = std::chrono::steady_clock::now();
     while (true) {
         int timeout = runnable.empty() ? -1 : 0;
+        if(std::chrono::steady_clock::now() - wait_time > std::chrono::milliseconds(200)){
+            timeout = 0;
+        }
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), timeout);
         if (n == -1) {
             if (errno == EINTR) {
@@ -458,7 +463,7 @@ int run_reactor_server(const ServerOptions& so) {
         auto time_now = std::chrono::steady_clock::now();
         std::vector<std::uint64_t> timeout_id;
         for(auto it = connections.begin();it != connections.end();++it){
-            if(time_now - it->second.last_activity > std::chrono::milliseconds(200)){
+            if(time_now - it->second.last_activity > std::chrono::seconds(30)){
                 timeout_id.push_back(it->first);
             }
         }
