@@ -8,11 +8,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
-#include <limits>
-#include <stdexcept>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <netinet/in.h>
+#include <stdexcept>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -29,10 +29,11 @@ struct ServerOptions {
     std::string mode = "blocking";
     std::chrono::milliseconds idle_timeout{30000};
     std::chrono::milliseconds frame_timeout{10000};
+    std::chrono::milliseconds output_stall_timeout{10000};
 };
 
 struct InputChunk {
-    std::size_t bytes; // 这一批还有多少字节留在缓冲
+    std::size_t bytes;             // 这一批还有多少字节留在缓冲
     Clock::time_point received_at; // 这一批字节的接收时间
 };
 
@@ -40,7 +41,7 @@ struct Connection {
     std::uint64_t id;
     int fd;
     std::chrono::steady_clock::time_point last_activity;
-
+    Clock::time_point output_progress_at;
     std::string input;
     std::deque<InputChunk> input_chunks;
     std::string output;
@@ -80,9 +81,9 @@ public:
     }
 
 private:
-    std::deque<InputChunk>::const_iterator next_;   // 当前正在查看的接收批次
-    std::deque<InputChunk>::const_iterator end_;    // 时间记录队列的结束位置
-    std::size_t begin_ = 0; // 当前批次在input中的起始偏移
+    std::deque<InputChunk>::const_iterator next_; // 当前正在查看的接收批次
+    std::deque<InputChunk>::const_iterator end_;  // 时间记录队列的结束位置
+    std::size_t begin_ = 0;                       // 当前批次在input中的起始偏移
 };
 
 Clock::time_point input_received_at(const Connection& conn, std::size_t offset) {
@@ -218,8 +219,7 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
                 return false;
             }
             so.port = port;
-        } else if (strcmp(argv[i], "--idle-timeout-ms") == 0 ||
-                   strcmp(argv[i], "--frame-timeout-ms") == 0) {
+        } else if (strcmp(argv[i], "--idle-timeout-ms") == 0 || strcmp(argv[i], "--frame-timeout-ms") == 0) {
             std::string name = argv[i];
             if (i + 1 >= argc) {
                 error_out = "Missing parameter value: " + name;
@@ -264,7 +264,9 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
             conn.sent += static_cast<std::size_t>(sent);
             remaining_budget -= static_cast<std::size_t>(sent);
             budb.used_bytes -= sent;
-            conn.last_activity = std::chrono::steady_clock::now();
+            const auto now = Clock::now();
+            conn.last_activity = now;
+            conn.output_progress_at = now;
             continue;
         } else if (sent == -1) {
             if (errno == EINTR) {
@@ -306,14 +308,15 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             budb.used_bytes -= frame_size;
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
-            if (budb.used_bytes > budb.limit_bytes ||
-                frame.size() > budb.limit_bytes - budb.used_bytes) {
+            if (budb.used_bytes > budb.limit_bytes || frame.size() > budb.limit_bytes - budb.used_bytes) {
                 std::cerr << "litmit_bytes exceeded, id=" << conn.id << "\n";
                 return ProcessResult::OutputLimit;
             }
             if (conn.sent > 0) {
                 conn.output.erase(0, conn.sent);
                 conn.sent = 0;
+            } else {
+                conn.output_progress_at = Clock::now(); // 出现积压开始计时
             }
             std::size_t pending = conn.output.size();
             if (pending > max_send_bytes || frame.size() > max_send_bytes - pending) {
@@ -514,8 +517,7 @@ int run_reactor_server(const ServerOptions& so) {
                 if (received > 0) {
                     Clock::time_point received_at = Clock::now();
                     std::size_t received_bytes = static_cast<std::size_t>(received);
-                    if (conn.input.size() > max_received_bytes ||
-                        budb.used_bytes > budb.limit_bytes ||
+                    if (conn.input.size() > max_received_bytes || budb.used_bytes > budb.limit_bytes ||
                         received_bytes > max_received_bytes - conn.input.size() ||
                         received_bytes > budb.limit_bytes - budb.used_bytes) {
                         std::cerr << "input budget exceeded, id=" << conn.id << '\n';
@@ -623,6 +625,10 @@ int run_reactor_server(const ServerOptions& so) {
                 timeout_id.push_back(entry.first);
             } else if (time_now - conn.last_activity >= so.idle_timeout) {
                 std::cerr << "idle timeout, id=" << conn.id << '\n';
+                timeout_id.push_back(entry.first);
+            } else if (conn.sent < conn.output.size() &&
+                       time_now - conn.output_progress_at >= so.output_stall_timeout) {
+                std::cerr << "output stall timeout, id=" << conn.id << '\n';
                 timeout_id.push_back(entry.first);
             }
         }
