@@ -232,8 +232,10 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
             }
             if (name == "--idle-timeout-ms") {
                 so.idle_timeout = timeout;
-            } else {
+            } else if (name == "--frame_timeout") {
                 so.frame_timeout = timeout;
+            } else {
+                so.output_stall_timeout = timeout;
             }
         } else if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
@@ -315,8 +317,6 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             if (conn.sent > 0) {
                 conn.output.erase(0, conn.sent);
                 conn.sent = 0;
-            } else {
-                conn.output_progress_at = Clock::now(); // 出现积压开始计时
             }
             std::size_t pending = conn.output.size();
             if (pending > max_send_bytes || frame.size() > max_send_bytes - pending) {
@@ -324,7 +324,11 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
                           << ", frame=" << frame.size() << ", limit=" << max_send_bytes << '\n';
                 return ProcessResult::OutputLimit;
             }
+            const bool was_empty = conn.sent == conn.output.size();
             conn.output.append(frame);
+            if (was_empty) {
+                conn.output_progress_at = Clock::now();
+            }
             budb.used_bytes += frame.size();
             budb.peak_bytes = std::max(budb.used_bytes, budb.peak_bytes);
             std::cout << "id=" << conn.id << " pending=" << conn.output.size() - conn.sent << std::endl;
