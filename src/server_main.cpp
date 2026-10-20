@@ -7,7 +7,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
-#include <ctime>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <deque>
 #include <iostream>
 #include <netinet/in.h>
@@ -18,11 +20,20 @@
 #include <unistd.h>
 #include <vector>
 
-enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError, OutputLimit };
+using Clock = std::chrono::steady_clock;
+
+enum class ProcessResult { NeedMore, BudgetExhausted, ProtocolError, OutputLimit, FrameTimeout };
 struct ServerOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
     std::string mode = "blocking";
+    std::chrono::milliseconds idle_timeout{30000};
+    std::chrono::milliseconds frame_timeout{10000};
+};
+
+struct InputChunk {
+    std::size_t bytes; // 这一批还有多少字节留在缓冲
+    Clock::time_point received_at; // 这一批字节的接收时间
 };
 
 struct Connection {
@@ -31,6 +42,7 @@ struct Connection {
     std::chrono::steady_clock::time_point last_activity;
 
     std::string input;
+    std::deque<InputChunk> input_chunks;
     std::string output;
     std::size_t sent = 0;
     bool read_closed = false;
@@ -46,6 +58,122 @@ struct Budget_Bytes {
     std::size_t used_bytes = 0;                       // 当前已经占用的字节
     std::size_t peak_bytes = 0;                       // 已占用字节历史峰值
 };
+
+// 游标按递增偏移查询接收时间，使多帧扫描只遍历每个批次一次。
+class InputTimeCursor {
+public:
+    explicit InputTimeCursor(const Connection& conn)
+        : next_(conn.input_chunks.begin()), end_(conn.input_chunks.end()) {}
+
+    Clock::time_point at(std::size_t offset) {
+        if (offset < begin_) {
+            throw std::logic_error("input timestamp offsets must be nondecreasing");
+        }
+        while (next_ != end_ && offset - begin_ >= next_->bytes) {
+            begin_ += next_->bytes;
+            ++next_;
+        }
+        if (next_ == end_) {
+            throw std::logic_error("input timestamp metadata is incomplete");
+        }
+        return next_->received_at;
+    }
+
+private:
+    std::deque<InputChunk>::const_iterator next_;   // 当前正在查看的接收批次
+    std::deque<InputChunk>::const_iterator end_;    // 时间记录队列的结束位置
+    std::size_t begin_ = 0; // 当前批次在input中的起始偏移
+};
+
+Clock::time_point input_received_at(const Connection& conn, std::size_t offset) {
+    InputTimeCursor times(conn);
+    return times.at(offset);
+}
+
+void consume_input_times(Connection& conn, std::size_t bytes) {
+    while (bytes > 0) {
+        if (conn.input_chunks.empty()) {
+            throw std::logic_error("cannot consume missing input timestamps");
+        }
+        InputChunk& chunk = conn.input_chunks.front();
+        std::size_t consumed = std::min(bytes, chunk.bytes);
+        chunk.bytes -= consumed;
+        bytes -= consumed;
+        if (chunk.bytes == 0) {
+            conn.input_chunks.pop_front();
+        }
+    }
+}
+
+void append_received_input(Connection& conn, const char* data, std::size_t bytes,
+                           Clock::time_point received_at, Budget_Bytes& budget) {
+    if (bytes == 0) {
+        return;
+    }
+    conn.input_chunks.push_back(InputChunk{bytes, received_at});
+    try {
+        conn.input.append(data, bytes);
+    } catch (...) {
+        conn.input_chunks.pop_back();
+        throw;
+    }
+    budget.used_bytes += bytes;
+    budget.peak_bytes = std::max(budget.peak_bytes, budget.used_bytes);
+}
+
+void discard_input(Connection& conn, Budget_Bytes& budget) {
+    assert(budget.used_bytes >= conn.input.size());
+    budget.used_bytes -= conn.input.size();
+    conn.input.clear();
+    conn.input_chunks.clear();
+}
+
+// 完整帧看接收耗时，半帧看当前年龄；不把排队等待时间当作接收时间。
+bool frame_deadline_expired(const Connection& conn, Clock::time_point now,
+                            std::chrono::milliseconds frame_timeout) {
+    std::size_t offset = 0;
+    InputTimeCursor times(conn);
+    while (offset < conn.input.size()) {
+        std::size_t frame_size = 0;
+        ParseStatus status = peek_frame(conn.input, offset, frame_size);
+        if (status == ParseStatus::ProtocolError) {
+            return false; // 协议错误由现有请求处理路径处理。
+        }
+        Clock::time_point first = times.at(offset);
+        if (status == ParseStatus::NeedMore) {
+            return now - first >= frame_timeout;
+        }
+        Clock::time_point last = times.at(offset + frame_size - 1);
+        if (last - first >= frame_timeout) {
+            return true;
+        }
+        offset += frame_size;
+    }
+    return false;
+}
+
+bool parse_timeout_ms(const std::string& text, std::chrono::milliseconds& timeout_out) {
+    if (text.empty()) {
+        return false;
+    }
+    const std::uint32_t limit = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
+    std::uint32_t value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        std::uint32_t digit = static_cast<std::uint32_t>(c - '0');
+        if (value > (limit - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    if (value == 0) {
+        return false;
+    }
+    timeout_out = std::chrono::milliseconds(value);
+    return true;
+}
 
 bool parse_port(const std::string& text, std::uint16_t& port_out) {
     if (text.empty())
@@ -90,6 +218,23 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
                 return false;
             }
             so.port = port;
+        } else if (strcmp(argv[i], "--idle-timeout-ms") == 0 ||
+                   strcmp(argv[i], "--frame-timeout-ms") == 0) {
+            std::string name = argv[i];
+            if (i + 1 >= argc) {
+                error_out = "Missing parameter value: " + name;
+                return false;
+            }
+            std::chrono::milliseconds timeout;
+            if (!parse_timeout_ms(argv[++i], timeout)) {
+                error_out = "Timeout must be an integer from 1 to 2147483647 ms: " + name;
+                return false;
+            }
+            if (name == "--idle-timeout-ms") {
+                so.idle_timeout = timeout;
+            } else {
+                so.frame_timeout = timeout;
+            }
         } else if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
                 error_out = "Missing parameter value";
@@ -140,17 +285,29 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
     return true;
 }
 
-ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames, Budget_Bytes& budb) {
+ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames, Budget_Bytes& budb,
+                            std::chrono::milliseconds frame_timeout = std::chrono::seconds(10)) {
     std::size_t max_send_bytes = 64 * 1024;
     while (max_frames > 0) {
         std::string payload;
-        std::size_t before_decode_size = conn.input.size();
-        ParseStatus status = try_decode_frame(conn.input, payload);
+        std::size_t frame_size = 0;
+        ParseStatus status = peek_frame(conn.input, 0, frame_size);
         if (status == ParseStatus::FrameReady) {
-            budb.used_bytes -= (before_decode_size - conn.input.size());
+            InputTimeCursor times(conn);
+            Clock::time_point first = times.at(0);
+            Clock::time_point last = times.at(frame_size - 1);
+            if (last - first >= frame_timeout) {
+                std::cerr << "frame receive timeout, id=" << conn.id << '\n';
+                return ProcessResult::FrameTimeout;
+            }
+            try_decode_frame(conn.input, payload);
+            consume_input_times(conn, frame_size);
+            assert(budb.used_bytes >= frame_size);
+            budb.used_bytes -= frame_size;
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
-            if (frame.size() > budb.limit_bytes - budb.used_bytes) {
+            if (budb.used_bytes > budb.limit_bytes ||
+                frame.size() > budb.limit_bytes - budb.used_bytes) {
                 std::cerr << "litmit_bytes exceeded, id=" << conn.id << "\n";
                 return ProcessResult::OutputLimit;
             }
@@ -355,14 +512,17 @@ int run_reactor_server(const ServerOptions& so) {
                 } while (received == -1 && errno == EINTR);
 
                 if (received > 0) {
-                    if (received > max_received_bytes - conn.input.size() ||
-                        received > budb.limit_bytes - budb.used_bytes) {
+                    Clock::time_point received_at = Clock::now();
+                    std::size_t received_bytes = static_cast<std::size_t>(received);
+                    if (conn.input.size() > max_received_bytes ||
+                        budb.used_bytes > budb.limit_bytes ||
+                        received_bytes > max_received_bytes - conn.input.size() ||
+                        received_bytes > budb.limit_bytes - budb.used_bytes) {
+                        std::cerr << "input budget exceeded, id=" << conn.id << '\n';
                         close_now = true;
                     } else {
-                        conn.last_activity = std::chrono::steady_clock::now();
-                        conn.input.append(buffer, static_cast<std::size_t>(received));
-                        budb.used_bytes += received;
-                        budb.peak_bytes = std::max(budb.peak_bytes, budb.used_bytes);
+                        conn.last_activity = received_at;
+                        append_received_input(conn, buffer, received_bytes, received_at, budb);
                         if (!conn.queued) {
                             runnable.push_back(conn.id);
                             conn.queued = true;
@@ -421,7 +581,7 @@ int run_reactor_server(const ServerOptions& so) {
             Connection& conn = it->second;
             conn.queued = false;
             bool close_now = false;
-            auto result = process_input(conn, store, max_frames, budb);
+            auto result = process_input(conn, store, max_frames, budb, so.frame_timeout);
             if (result == ProcessResult::BudgetExhausted) {
                 if (!conn.queued) {
                     runnable.push_back(conn.id);
@@ -431,9 +591,8 @@ int run_reactor_server(const ServerOptions& so) {
                 // 所有完整帧已经处理完。
                 if (conn.read_closed && !conn.input.empty()) {
                     // 已经 EOF，残留半帧不可能再补齐。
-                    budb.used_bytes -= conn.input.size();
                     std::cout << "discard incomplete frame, id=" << conn.id << std::endl;
-                    conn.input.clear();
+                    discard_input(conn, budb);
                 }
             } else {
                 close_now = true;
@@ -455,15 +614,20 @@ int run_reactor_server(const ServerOptions& so) {
                 continue;
             }
         }
-        auto time_now = std::chrono::steady_clock::now();
+        Clock::time_point time_now = Clock::now();
         std::vector<std::uint64_t> timeout_id;
-        for(auto it = connections.begin();it != connections.end();++it){
-            if(time_now - it->second.last_activity > std::chrono::seconds(30)){
-                timeout_id.push_back(it->first);
+        for (const auto& entry : connections) {
+            const Connection& conn = entry.second;
+            if (frame_deadline_expired(conn, time_now, so.frame_timeout)) {
+                std::cerr << "frame receive timeout, id=" << conn.id << '\n';
+                timeout_id.push_back(entry.first);
+            } else if (time_now - conn.last_activity >= so.idle_timeout) {
+                std::cerr << "idle timeout, id=" << conn.id << '\n';
+                timeout_id.push_back(entry.first);
             }
         }
-        for(auto& t : timeout_id){
-            close_connection(epfd, connections, t, budb);
+        for (std::uint64_t id : timeout_id) {
+            close_connection(epfd, connections, id, budb);
         }
     }
     while (!connections.empty()) {

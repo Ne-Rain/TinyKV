@@ -6,8 +6,8 @@
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 std::string encode_frame(const std::string& payload) {
     if (payload.empty() || payload.size() > 8192) {
@@ -23,21 +23,33 @@ std::string encode_frame(const std::string& payload) {
     return frame;
 }
 
-ParseStatus try_decode_frame(std::string& buffer, std::string& payload_out) {
-    if (buffer.size() < 4) {
+ParseStatus peek_frame(const std::string& buffer, std::size_t offset, std::size_t& frame_size_out) {
+    frame_size_out = 0;
+    if (offset > buffer.size()) {
+        return ParseStatus::ProtocolError;
+    }
+    std::size_t available = buffer.size() - offset;
+    if (available < sizeof(std::uint32_t)) {
         return ParseStatus::NeedMore;
     }
     std::uint32_t network_length = 0;
-    memcpy(&network_length, buffer.data(), sizeof(network_length));
+    std::memcpy(&network_length, buffer.data() + offset, sizeof(network_length));
     std::uint32_t length = ntohl(network_length);
     if (length == 0 || length > 8192) {
         return ParseStatus::ProtocolError;
     }
-    if (buffer.size() < 4 + static_cast<std::size_t>(length)) {
-        return ParseStatus::NeedMore;
+    frame_size_out = sizeof(network_length) + static_cast<std::size_t>(length);
+    return available < frame_size_out ? ParseStatus::NeedMore : ParseStatus::FrameReady;
+}
+
+ParseStatus try_decode_frame(std::string& buffer, std::string& payload_out) {
+    std::size_t frame_size = 0;
+    ParseStatus status = peek_frame(buffer, 0, frame_size);
+    if (status != ParseStatus::FrameReady) {
+        return status;
     }
-    payload_out.assign(buffer, 4, length);
-    buffer.erase(0, 4 + static_cast<std::size_t>(length));
+    payload_out.assign(buffer, sizeof(std::uint32_t), frame_size - sizeof(std::uint32_t));
+    buffer.erase(0, frame_size);
     return ParseStatus::FrameReady;
 }
 
@@ -45,8 +57,7 @@ bool valid_command_text(const std::string& payload) {
     if (payload.empty()) {
         return false;
     }
-    if (payload.front() == ' ' || payload.back() == ' ' ||
-        payload.find("  ") != std::string::npos) {
+    if (payload.front() == ' ' || payload.back() == ' ' || payload.find("  ") != std::string::npos) {
         return false;
     }
     for (char ch : payload) {
@@ -97,7 +108,7 @@ bool parse_command(const std::string& payload, Command& command_out, std::string
         error_out = "ERR UNKNOWN_COMMAND";
         return false;
     }
-    if(tokens.size() != expected_tokens){
+    if (tokens.size() != expected_tokens) {
         error_out = "ERR INVALID_ARGUMENT";
         return false;
     }

@@ -15,6 +15,8 @@ struct Command {
 // 消息帧封装
 std::string encode_frame(const std::string& payload);
 
+ParseStatus peek_frame(const std::string& buffer, std::size_t offset, std::size_t& frame_size_out);
+
 // 消息帧解码
 ParseStatus try_decode_frame(std::string& buffer, std::string& payload_out);
 
