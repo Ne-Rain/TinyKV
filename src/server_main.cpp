@@ -221,11 +221,19 @@ void append_received_input(Connection& conn, const char* data, std::size_t bytes
     budget.peak_bytes = std::max(budget.peak_bytes, budget.used_bytes);
 }
 
+// 大容量空缓存回收
+void release_empty_buffer(std::string& buffer){
+    if(buffer.empty() && buffer.capacity() > 8 * 1024){
+        std::string{}.swap(buffer);
+    }
+}
+
 void discard_input(Connection& conn, Budget_Bytes& budget) {
     assert(budget.used_bytes >= conn.input.size());
     budget.used_bytes -= conn.input.size();
     conn.input.clear();
     conn.input_chunks.clear();
+    release_empty_buffer(conn.input);
 }
 
 // 完整帧看接收耗时，半帧看当前年龄；不把排队等待时间当作接收时间。
@@ -388,6 +396,7 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
     if (conn.sent == conn.output.size()) {
         conn.output.clear();
         conn.sent = 0;
+        release_empty_buffer(conn.output);
     }
     return true;
 }
@@ -420,6 +429,7 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             if (conn.sent > 0) {
                 conn.output.erase(0, conn.sent);
                 conn.sent = 0;
+                release_empty_buffer(conn.output);
             }
             std::size_t pending = conn.output.size();
             if (pending > max_send_bytes || frame.size() > max_send_bytes - pending) {
