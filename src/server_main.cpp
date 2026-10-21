@@ -27,6 +27,22 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint64_t listen_event_id = 0;
 constexpr std::uint64_t signal_event_id = std::numeric_limits<std::uint64_t>::max();
 
+void log_fd_error(const char* operation, std::uint64_t id, int fd, int error) {
+    std::cerr << operation << ", id=" << id << ", fd=" << fd << ", error=" << error
+              << ", message=" << (error != 0 ? std::strerror(error) : "no pending error") << '\n';
+}
+
+void log_socket_error(const char* operation, std::uint64_t id, int fd) {
+    int socket_error = 0;
+    socklen_t length = sizeof(socket_error);
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == -1) {
+        log_fd_error("getsockopt(SO_ERROR)", id, fd, errno);
+    } else {
+        log_fd_error(operation, id, fd, socket_error);
+    }
+}
+
 // 只在reactor入口安装；析构时关闭新fd并恢复调用者的信号屏蔽字。
 class SignalFd {
 public:
@@ -46,8 +62,8 @@ public:
     bool open() {
         sigset_t mask;
         sigemptyset(&mask);
-        sigaddset(&mask, SIGINT); // Ctrl+C
-        sigaddset(&mask, SIGTERM);  // 外部终止请求
+        sigaddset(&mask, SIGINT);                                   // Ctrl+C
+        sigaddset(&mask, SIGTERM);                                  // 外部终止请求
         if (sigprocmask(SIG_BLOCK, &mask, &previous_mask_) == -1) { // 给当前线程设置这两个信号的阻塞
             perror("sigprocmask block");
             return false;
@@ -55,7 +71,7 @@ public:
         mask_installed_ = true;
         fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC); // 创建读取信号的fd
         if (fd_ == -1) {
-            perror("signalfd");
+            log_fd_error("read signalfd", signal_event_id, fd_, errno);
             return false;
         }
         return true;
@@ -222,8 +238,8 @@ void append_received_input(Connection& conn, const char* data, std::size_t bytes
 }
 
 // 大容量空缓存回收
-void release_empty_buffer(std::string& buffer){
-    if(buffer.empty() && buffer.capacity() > 8 * 1024){
+void release_empty_buffer(std::string& buffer) {
+    if (buffer.empty() && buffer.capacity() > 8 * 1024) {
         std::string{}.swap(buffer);
     }
 }
@@ -382,14 +398,16 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
             conn.output_progress_at = now;
             continue;
         } else if (sent == -1) {
-            if (errno == EINTR) {
+            const int error = errno;
+            if (error == EINTR)
                 continue;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (error == EAGAIN || error == EWOULDBLOCK)
                 return true;
-            } else {
-                return false;
-            }
+
+            log_fd_error("send", conn.id, conn.fd, error);
+            return false;
         } else {
+            std::cerr << "send returned zero, id=" << conn.id << ", fd=" << conn.fd << '\n';
             return false;
         }
     }
@@ -468,7 +486,11 @@ bool update_interest(int epfd, const Connection& conn, bool stopping = false) {
     if (conn.sent < conn.output.size()) {
         event.events |= EPOLLOUT;
     }
-    return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &event) == -1) {
+        log_fd_error("epoll_ctl MOD", conn.id, conn.fd, errno);
+        return false;
+    }
+    return true;
 }
 
 void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections, std::uint64_t id,
@@ -480,7 +502,7 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     }
     int fd = it->second.fd;
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-        perror("epoll_ctl DEL");
+        log_fd_error("epoll_ctl DEL", id, fd, errno);
     }
     budb.used_bytes -= it->second.input.size();
     budb.used_bytes -= (it->second.output.size() - it->second.sent);
@@ -578,7 +600,7 @@ int run_reactor_server(const ServerOptions& so) {
     event.data.u64 = listen_event_id;
     int res = epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event);
     if (res == -1) {
-        perror("epoll_ctl ADD listen");
+        log_fd_error("epoll_ctl ADD listen", listen_event_id, lfd, errno);
         close(epfd);
         close(lfd);
         return 1;
@@ -588,7 +610,7 @@ int run_reactor_server(const ServerOptions& so) {
     signal_event.events = EPOLLIN;
     signal_event.data.u64 = signal_event_id;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, signals.fd(), &signal_event) == -1) {
-        perror("epoll_ctl ADD signalfd");
+        log_fd_error("epoll_ctl ADD signalfd", signal_event_id, signals.fd(), errno);
         close(epfd);
         close(lfd);
         return 1;
@@ -616,7 +638,7 @@ int run_reactor_server(const ServerOptions& so) {
             if (errno == EINTR) {
                 continue; // 这里继续外层 while，重新等待
             }
-            perror("epoll_wait");
+            log_fd_error("epoll_wait", 0, epfd, errno);
             exit_code = 1;
             break;
         }
@@ -637,11 +659,30 @@ int run_reactor_server(const ServerOptions& so) {
             continue;
         for (int i = 0; i < n; ++i) {
             std::uint64_t id = events[i].data.u64;
-            if (id == signal_event_id)
+            std::uint32_t ready = events[i].events;
+            if (id == signal_event_id) {
+                if (ready & (EPOLLERR | EPOLLHUP)) {
+                    std::cerr << "signalfd event failure, fd=" << signals.fd() << ", events=" << ready
+                              << '\n';
+                    exit_code = 1;
+                    flag = 1;
+                    break;
+                }
                 continue;
+            }
             if (id == listen_event_id) {
-                if (shutdown_state.stopping || lfd < 0 || !(events[i].events & EPOLLIN))
+                if (shutdown_state.stopping || lfd < 0)
                     continue;
+                if (ready & (EPOLLERR | EPOLLHUP)) {
+                    log_socket_error("listen event failure", listen_event_id, lfd);
+                    exit_code = 1;
+                    flag = 1;
+                    break;
+                }
+                if (!(ready & EPOLLIN))
+                    continue;
+
+                // 后面保留原来的 accept 循环。
                 for (int attempt = 0; attempt < 16; ++attempt) {
                     int cfd = accept(lfd, nullptr, nullptr);
                     if (cfd >= 0) {
@@ -672,7 +713,7 @@ int run_reactor_server(const ServerOptions& so) {
                         client_event.data.u64 = id;
                         int res = epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &client_event);
                         if (res == -1) {
-                            perror("epoll_ctl ADD");
+                            log_fd_error("epoll_ctl ADD", id, cfd, errno);
                             close(cfd);
                             continue;
                         }
@@ -700,8 +741,30 @@ int run_reactor_server(const ServerOptions& so) {
             Connection& conn = it->second;
             int fd = conn.fd;
 
-            std::uint32_t ready = events[i].events;
+            if (ready & EPOLLERR) {
+                log_socket_error("client EPOLLERR", conn.id, fd);
+                close_connection(epfd, connections, id, budb);
+                continue;
+            }
             bool close_now = false;
+
+            if (ready & EPOLLERR) {
+                int socket_error = 0;
+                socklen_t length = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == -1) {
+                    const int saved_errno = errno;
+                    std::cerr << "getsockopt failed, id=" << conn.id << ", fd=" << fd
+                              << ", errno=" << saved_errno << ", message=" << std::strerror(saved_errno)
+                              << '\n';
+                } else {
+                    std::cerr << "EPOLLERR, id=" << conn.id << ", fd=" << fd << ", so_error=" << socket_error
+                              << ", message="
+                              << (socket_error != 0 ? std::strerror(socket_error) : "no pending error")
+                              << '\n';
+                }
+                close_connection(epfd, connections, id, budb);
+                continue;
+            }
 
             // 1. 处理读取。
             if (!shutdown_state.stopping && !conn.read_closed &&
@@ -737,7 +800,7 @@ int run_reactor_server(const ServerOptions& so) {
                         conn.queued = true;
                     }
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("recv");
+                    log_fd_error("recv", conn.id, fd, errno);
                     close_now = true;
                 }
             }
