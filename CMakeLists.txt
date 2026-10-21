@@ -23,12 +23,15 @@ add_library(tinykv_core STATIC ${CORE_SOURCES})
 target_include_directories(tinykv_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+find_package(Threads REQUIRED)
+target_link_libraries(tinykv_core PUBLIC Threads::Threads)
 
 # 服务端。
 add_executable(tinykv_server
     src/server_main.cpp
 )
 target_link_libraries(tinykv_server PRIVATE tinykv_core)
+
 
 # 客户端。
 aux_source_directory(
