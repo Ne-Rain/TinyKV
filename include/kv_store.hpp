@@ -2,11 +2,12 @@
 #include <cstddef>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 class KVStore {
 public:
     KVStore(std::size_t max_bytes) : max_bytes_(max_bytes){}
 
-    std::size_t get_used_bytes();
+    std::size_t get_used_bytes() const;
 
     bool set(const std::string& key, const std::string& value);
     bool get(const std::string& key, std::string& value_out) const;
@@ -16,4 +17,5 @@ private:
     std::size_t max_bytes_;
     std::size_t used_bytes_{0};
     std::unordered_map<std::string, std::string> data_;
+    mutable std::mutex mtx_;
 };

@@ -1,9 +1,14 @@
 #include "kv_store.hpp"
 #include <cstddef>
+#include <mutex>
 
-std::size_t KVStore::get_used_bytes() { return used_bytes_; }
+std::size_t KVStore::get_used_bytes() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return used_bytes_;
+}
 
 bool KVStore::set(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(mtx_);
     // key存在
     auto it = data_.find(key);
     if (it != data_.end()) {
@@ -27,6 +32,7 @@ bool KVStore::set(const std::string& key, const std::string& value) {
 }
 
 bool KVStore::get(const std::string& key, std::string& value_out) const {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = data_.find(key);
     if (it != data_.end()) {
         value_out = it->second;
@@ -36,6 +42,7 @@ bool KVStore::get(const std::string& key, std::string& value_out) const {
 }
 
 std::size_t KVStore::del(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = data_.find(key);
     if (it == data_.end()) {
         return 0;
