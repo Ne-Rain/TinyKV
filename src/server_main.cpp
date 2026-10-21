@@ -420,6 +420,7 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
             consume_input_times(conn, frame_size);
             assert(budb.used_bytes >= frame_size);
             budb.used_bytes -= frame_size;
+            release_empty_buffer(conn.input);
             std::string response = handle_payload(store, payload);
             std::string frame = encode_frame(response);
             if (budb.used_bytes > budb.limit_bytes || frame.size() > budb.limit_bytes - budb.used_bytes) {
