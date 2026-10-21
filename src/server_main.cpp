@@ -71,7 +71,7 @@ public:
         mask_installed_ = true;
         fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC); // 创建读取信号的fd
         if (fd_ == -1) {
-            log_fd_error("read signalfd", signal_event_id, fd_, errno);
+            log_fd_error("signalfd", signal_event_id, fd_, errno);
             return false;
         }
         return true;
@@ -538,7 +538,6 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
         if (conn.sent == conn.output.size()) {
             close_connection(epfd, connections, id, budget);
         } else if (!update_interest(epfd, conn, true)) {
-            perror("epoll_ctl MOD draining");
             close_connection(epfd, connections, id, budget);
             ok = false;
         }
@@ -748,24 +747,6 @@ int run_reactor_server(const ServerOptions& so) {
             }
             bool close_now = false;
 
-            if (ready & EPOLLERR) {
-                int socket_error = 0;
-                socklen_t length = sizeof(socket_error);
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == -1) {
-                    const int saved_errno = errno;
-                    std::cerr << "getsockopt failed, id=" << conn.id << ", fd=" << fd
-                              << ", errno=" << saved_errno << ", message=" << std::strerror(saved_errno)
-                              << '\n';
-                } else {
-                    std::cerr << "EPOLLERR, id=" << conn.id << ", fd=" << fd << ", so_error=" << socket_error
-                              << ", message="
-                              << (socket_error != 0 ? std::strerror(socket_error) : "no pending error")
-                              << '\n';
-                }
-                close_connection(epfd, connections, id, budb);
-                continue;
-            }
-
             // 1. 处理读取。
             if (!shutdown_state.stopping && !conn.read_closed &&
                 (ready & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
@@ -826,7 +807,6 @@ int run_reactor_server(const ServerOptions& so) {
             // 4. 保留连接时，更新关注。
             // 新生成的响应会让 update_interest 加入 EPOLLOUT。
             if (!close_now && !update_interest(epfd, conn, shutdown_state.stopping)) {
-                perror("epoll_ctl MOD");
                 close_now = true;
             }
 
@@ -861,7 +841,7 @@ int run_reactor_server(const ServerOptions& so) {
                 // 所有完整帧已经处理完。
                 if (conn.read_closed && !conn.input.empty()) {
                     // 已经 EOF，残留半帧不可能再补齐。
-                    std::cout << "discard incomplete frame, id=" << conn.id << std::endl;
+                    std::cout << "discard incomplete frame, id=" << conn.id << "\n";
                     discard_input(conn, budb);
                 }
             } else {
