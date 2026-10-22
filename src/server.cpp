@@ -17,14 +17,14 @@ bool Budget_Bytes::try_reserve(std::size_t bytes) noexcept {
 
 void Budget_Bytes::release(std::size_t bytes) noexcept {
     assert(bytes <= used_bytes);
-    --used_bytes;
+    used_bytes -= bytes;
 }
 
 bool try_reserve_task(TaskQuota& quota, Budget_Bytes& budget, TaskReservation& out) noexcept {
-    if (!quota.try_acquire()) {
+    if (out.active || !quota.try_acquire()) {
         return false;
     }
-    if (!budget.try_reserve(out.response_bytes)) {
+    if (!budget.try_reserve(response_bytes)) {
         quota.release();
         return false;
     }
@@ -38,4 +38,6 @@ void rollback_task(TaskQuota& quota, Budget_Bytes& budget, TaskReservation& rese
     }
     quota.release();
     budget.release(reservation.response_bytes);
+    reservation.response_bytes = 0;
+    reservation.active = false;
 }
