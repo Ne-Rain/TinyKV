@@ -2,7 +2,7 @@
 #include "task_quota.hpp"
 #include <cstddef>
 
-// 最大响应字节（帧头+“value”+4096最大空间）
+// 最大响应字节（帧头+"VALUE "+4096最大空间）
 constexpr std::size_t response_bytes = 4 + 6 + 4096;
 
 // 响应预留记录

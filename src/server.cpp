@@ -29,6 +29,7 @@ bool try_reserve_task(TaskQuota& quota, Budget_Bytes& budget, TaskReservation& o
         return false;
     }
     out.active = true;
+    out.response_bytes = response_bytes;
     return true;
 }
 
