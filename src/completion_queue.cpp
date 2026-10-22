@@ -9,7 +9,7 @@ void CompletionQueue::push(Completion completion) {
     queue_.push_back(std::move(completion));
 }
 
-std::deque<Completion> CompletionQueue::task_all() {
+std::deque<Completion> CompletionQueue::take_all() {
     std::deque<Completion> batch;
     {
         std::lock_guard<std::mutex> lock(mtx_);

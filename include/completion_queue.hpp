@@ -8,7 +8,7 @@ class CompletionQueue{
 public:
     void push(Completion completion);
 
-    std::deque<Completion> task_all();
+    std::deque<Completion> take_all();
 private:
     std::mutex mtx_;
     std::deque<Completion> queue_;
