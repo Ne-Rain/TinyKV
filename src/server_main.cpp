@@ -2,6 +2,7 @@
 #include "connection.hpp"
 #include "kv_store.hpp"
 #include "protocol.hpp"
+#include "server.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -167,12 +168,6 @@ struct Connection {
     Connection(std::uint64_t connection_id, int socket_fd,
                std::chrono::steady_clock::time_point last_activity_time)
         : id(connection_id), fd(socket_fd), last_activity(last_activity_time) {}
-};
-
-struct Budget_Bytes {
-    const std::size_t limit_bytes = 64 * 1024 * 1024; // 全局总上限
-    std::size_t used_bytes = 0;                       // 当前已经占用的字节
-    std::size_t peak_bytes = 0;                       // 已占用字节历史峰值
 };
 
 // 游标按递增偏移查询接收时间，使多帧扫描只遍历每个批次一次。

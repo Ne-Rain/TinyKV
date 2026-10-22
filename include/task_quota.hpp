@@ -2,6 +2,7 @@
 
 #include <cstddef>
 
+// 任务配额
 class TaskQuota {
 public:
     explicit TaskQuota(std::size_t limit);

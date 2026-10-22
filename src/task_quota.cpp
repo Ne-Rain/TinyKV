@@ -1,4 +1,5 @@
 #include "task_quota.hpp"
+#include <cassert>
 #include <stdexcept>
 
 TaskQuota::TaskQuota(std::size_t limit) {
@@ -15,7 +16,10 @@ bool TaskQuota::try_acquire() noexcept {
     ++used_;
     return true;
 }
-void TaskQuota::release() noexcept { --used_; }
+void TaskQuota::release() noexcept {
+    assert(used_ > 0);
+    --used_;
+}
 
 std::size_t TaskQuota::used() const noexcept { return used_; }
 std::size_t TaskQuota::limit() const noexcept { return limit_; }
