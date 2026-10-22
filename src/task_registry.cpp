@@ -30,22 +30,23 @@ bool release_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64
     return true;
 }
 
-bool finish_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence, TaskQuota& quota,
-                 std::size_t frame_bytes, Budget_Bytes& budget) {
+bool finish_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence,
+                 std::size_t frame_bytes, TaskQuota& quota, Budget_Bytes& budget) {
     auto task = tasks.find(connection_id);
     if (task == tasks.end()) {
         return false;
     }
-    auto reserver = task->second;
+    auto& reserver = task->second;
     if (reserver.sequence != sequence || !reserver.reservation.active) {
         return false;
     }
-    if(frame_bytes <= 0 || frame_bytes > reserver.reservation.response_bytes){
+    if (frame_bytes <= 0 || frame_bytes > reserver.reservation.response_bytes) {
         return false;
     }
     const std::size_t unused = reserver.reservation.response_bytes - frame_bytes;
     budget.release(unused);
     quota.release();
+    tasks.erase(task);
     reserver.reservation.active = false;
     return true;
 }
