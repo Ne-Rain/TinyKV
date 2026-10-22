@@ -1,8 +1,12 @@
+#include "async_types.hpp"
 #include "command_executor.hpp"
 #include "connection.hpp"
 #include "kv_store.hpp"
 #include "protocol.hpp"
 #include "server.hpp"
+#include "task_quota.hpp"
+#include "task_registry.hpp"
+#include "thread_pool.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -10,6 +14,7 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <netinet/in.h>
@@ -503,6 +508,101 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     budb.used_bytes -= (it->second.output.size() - it->second.sent);
     close(fd);
     connections.erase(it);
+}
+
+bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
+                        std::unordered_map<std::uint64_t, Connection>& connections, TaskQuota& quota,
+                        Budget_Bytes& budget) {
+    const std::uint64_t id = completion.connection_id;
+    const std::uint64_t sequence = completion.sequence;
+    auto task = tasks.find(id);
+    if (task == tasks.end()) {
+        return false;
+    }
+    auto& resever = task->second;
+    if (!resever.reservation.active || resever.sequence != sequence) {
+        return false;
+    }
+    // 连接已经不存在，释放占有资源
+    if (connections.find(id) == connections.end()) {
+        if (release_task(tasks, id, sequence, quota, budget)) {
+            std::string{}.swap(completion.response);
+            return true;
+        }
+        return false;
+    }
+    // 连接存在
+    auto registered = tasks.find(id);
+    if (registered == tasks.end() || registered->second.sequence != sequence ||
+        !registered->second.reservation.active) {
+        return false;
+    }
+
+    auto& conn = connections.at(id);
+    if (conn.sent > conn.output.size()) {
+        return false;
+    }
+
+    const std::size_t reserved_bytes = registered->second.reservation.response_bytes;
+    // 任务未结算，响应未追加的失败路径
+    auto discard_and_close = [&]() -> bool {
+        std::string{}.swap(completion.response);
+        const bool released = release_task(tasks, id, sequence, quota, budget);
+        close_connection(epfd, connections, id, budget);
+        return released;
+    };
+    if (reserved_bytes < 4 || completion.response.empty() ||
+        completion.response.size() > reserved_bytes - 4) {
+        return discard_and_close();
+    }
+    const std::size_t frame_bytes = 4 + completion.response.size();
+    const std::size_t pending = conn.output.size() - conn.sent;
+    const std::size_t output_limit = 64 * 1024;
+    if (pending < output_limit || output_limit - pending) {
+        return discard_and_close();
+    }
+    // 覆盖临时 frame，以及追加到 output 时新增的数据副本
+    const std::size_t temporary_bytes = 2 * frame_bytes;
+    if (!budget.try_reserve(temporary_bytes)) {
+        return discard_and_close();
+    }
+
+    const bool was_empty = pending == 0;
+
+    try {
+        // 移除已经发送的前缀
+        if (conn.sent > 0) {
+            conn.output.erase(0, conn.sent);
+            conn.sent = 0;
+            release_empty_buffer(conn.output);
+        }
+
+        std::string frame = encode_frame(completion.response);
+        conn.output.append(frame);
+
+        std::string{}.swap(completion.response);
+        std::string{}.swap(frame);
+
+        if (!finish_task(tasks, id, sequence, frame_bytes, quota, budget)) {
+            throw std::logic_error("completion settlement failed");
+        }
+        budget.release(temporary_bytes);
+        if (was_empty) {
+            conn.output_progress_at = Clock::now();
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fatal completion delivery, id=%llu: %s\n", static_cast<unsigned long long>(id),
+                     e.what());
+        std::terminate();
+    } catch (...) {
+        std::fprintf(stderr, "fatal completion delivery, id=%llu\n", static_cast<unsigned long long>(id));
+        std::terminate();
+    }
+
+    if (!update_interest(epfd, conn)) {
+        close_connection(epfd, connections, id, budget);
+    }
+    return true;
 }
 
 // 此时未解析的input不再接纳；同步执行过的命令已生成output，只排空这些响应。

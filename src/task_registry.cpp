@@ -47,6 +47,5 @@ bool finish_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_
     budget.release(unused);
     quota.release();
     tasks.erase(task);
-    reserver.reservation.active = false;
     return true;
 }
