@@ -15,5 +15,8 @@ using InFlightTasks = std::unordered_map<std::uint64_t, InFlightTask>;
 bool register_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence,
                    TaskQuota& quota, Budget_Bytes& budget);
 
-bool release_task(InFlightTasks& task, std::uint64_t connection_id, std::uint64_t sequence, TaskQuota& quota,
+bool release_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence, TaskQuota& quota,
+                  Budget_Bytes& budget);
+// 任务完成释放未使用资源
+bool finish_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence, TaskQuota& quota,
                   Budget_Bytes& budget);
