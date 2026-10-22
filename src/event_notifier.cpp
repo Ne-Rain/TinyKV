@@ -21,15 +21,19 @@ EventNotifier::~EventNotifier() {
 int EventNotifier::fd() const noexcept { return fd_; }
 
 bool EventNotifier::notify() const {
-    std::uint64_t one = 1;
-    ssize_t n = write(fd_, &one, sizeof(one));
-    if (n == 8) { // sizeof(uint64_t)
-        return true;
-    }
-    if (errno == EAGAIN) {
-        return true;
-    } else {
-        return false;
+    while (true) {
+        std::uint64_t one = 1;
+        ssize_t n = write(fd_, &one, sizeof(one));
+        if (n == 8) { // sizeof(uint64_t)
+            return true;
+        }
+        if (n == -1 && errno == EINTR) {
+            continue;
+        } else if (n == -1 && errno == EAGAIN) {
+            return true;
+        } else {
+            return false;
+        }
     }
 }
 bool EventNotifier::drain() const {
@@ -39,9 +43,9 @@ bool EventNotifier::drain() const {
         if (n == 8) {
             continue;
         }
-        if (errno == EINTR) {
+        if (n == -1 && errno == EINTR) {
             continue;
-        } else if (errno == EAGAIN) {
+        } else if (n == -1 && errno == EAGAIN) {
             return true;
         } else {
             return false;
