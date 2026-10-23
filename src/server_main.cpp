@@ -1,6 +1,8 @@
 #include "async_types.hpp"
 #include "command_executor.hpp"
+#include "completion_queue.hpp"
 #include "connection.hpp"
+#include "event_notifier.hpp"
 #include "kv_store.hpp"
 #include "protocol.hpp"
 #include "server.hpp"
@@ -32,6 +34,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr std::uint64_t listen_event_id = 0;
 constexpr std::uint64_t signal_event_id = std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint64_t completion_event_id = signal_event_id - 1;
 
 void log_fd_error(const char* operation, std::uint64_t id, int fd, int error) {
     std::cerr << operation << ", id=" << id << ", fd=" << fd << ", error=" << error
@@ -525,8 +528,8 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     }
     // 连接已经不存在，释放占有资源
     if (connections.find(id) == connections.end()) {
+        std::string{}.swap(completion.response);
         if (release_task(tasks, id, sequence, quota, budget)) {
-            std::string{}.swap(completion.response);
             return true;
         }
         return false;
@@ -558,7 +561,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     const std::size_t frame_bytes = 4 + completion.response.size();
     const std::size_t pending = conn.output.size() - conn.sent;
     const std::size_t output_limit = 64 * 1024;
-    if (pending < output_limit || output_limit - pending) {
+    if (pending < output_limit || frame_bytes > output_limit - pending) {
         return discard_and_close();
     }
     // 覆盖临时 frame，以及追加到 output 时新增的数据副本
@@ -672,6 +675,10 @@ int run_reactor_server(const ServerOptions& so) {
     SignalFd signals;
     if (!signals.open())
         return 1;
+    CompletionQueue completed;
+    EventNotifier notifier;
+    TaskQuota quota(1024);
+    InFlightTasks tasks;
     ShutdownState shutdown_state;
     Budget_Bytes budb;
     int lfd = create_listen_socket(so.host, so.port);
@@ -703,6 +710,16 @@ int run_reactor_server(const ServerOptions& so) {
     epoll_event signal_event{};
     signal_event.events = EPOLLIN;
     signal_event.data.u64 = signal_event_id;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, signals.fd(), &signal_event) == -1) {
+        log_fd_error("epoll_ctl ADD signalfd", signal_event_id, signals.fd(), errno);
+        close(epfd);
+        close(lfd);
+        return 1;
+    }
+
+    epoll_event completion_event{};
+    completion_event.events = EPOLLIN;
+    completion_event.data.u64 = completion_event_id;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, signals.fd(), &signal_event) == -1) {
         log_fd_error("epoll_ctl ADD signalfd", signal_event_id, signals.fd(), errno);
         close(epfd);
@@ -764,6 +781,31 @@ int run_reactor_server(const ServerOptions& so) {
                 }
                 continue;
             }
+            if (id == completion_event_id) {
+                if (ready & (EPOLLERR | EPOLLHUP)) {
+                    std::cerr << "completion event failure, fd=" << signals.fd() << ", events=" << ready
+                              << '\n';
+                    exit_code = 1;
+                    flag = 1;
+                    break;
+                }
+                if (!notifier.drain()) {
+                    continue;
+                }
+                std::deque<Completion> batch = completed.take_all();
+                for (auto& completion : batch) {
+                    bool ok = consume_completion(epfd, completion, tasks, connections, quota, budb);
+                    if (!ok) {
+                        log_socket_error("consume completion failure", completion_event_id, lfd);
+                        exit_code = 1;
+                        flag = 1;
+                        break;
+                    }
+                }
+                if (flag) {
+                    break;
+                }
+            }
             if (id == listen_event_id) {
                 if (shutdown_state.stopping || lfd < 0)
                     continue;
@@ -784,7 +826,7 @@ int run_reactor_server(const ServerOptions& so) {
                             close(cfd);
                             continue;
                         }
-                        if (next_id == signal_event_id) {
+                        if (next_id >= completion_event_id) {
                             std::cerr << "connection id exhausted\n";
                             close(cfd);
                             exit_code = 1;
