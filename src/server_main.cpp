@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -35,6 +36,16 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint64_t listen_event_id = 0;
 constexpr std::uint64_t signal_event_id = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t completion_event_id = signal_event_id - 1;
+
+enum class CollectResult {
+    NeedMore,
+    FrameLimit,
+    QueueFull,
+    ProtocolError,
+    FrameTimeout,
+    BudgetLimit,
+    SequenceExhausted
+};
 
 void log_fd_error(const char* operation, std::uint64_t id, int fd, int error) {
     std::cerr << operation << ", id=" << id << ", fd=" << fd << ", error=" << error
@@ -170,6 +181,8 @@ struct Connection {
     std::deque<InputChunk> input_chunks;
     std::string output;
     std::size_t sent = 0;
+    std::uint64_t next_sequence{0};          // 分配请求序号
+    std::deque<RequestTask> pending_request; // 保存已经收齐、尚未提交的请求
     bool read_closed = false;
     bool queued = false;
 
@@ -606,6 +619,68 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
         close_connection(epfd, connections, id, budget);
     }
     return true;
+}
+
+CollectResult collect_requests(Connection& conn, Budget_Bytes& budget, std::size_t max_frames,
+                               std::chrono::milliseconds frame_timeout) {
+    const std::size_t header_bytes = 4;
+    const std::size_t queue_limit = 64;
+    while (max_frames > 0) {
+        if (conn.pending_request.size() >= queue_limit) {
+            return CollectResult::QueueFull;
+        }
+        std::size_t frame_size = 0;
+        const ParseStatus status = peek_frame(conn.input, 0, frame_size);
+        if (status == ParseStatus::ProtocolError) {
+            return CollectResult::ProtocolError;
+        }
+        if (status == ParseStatus::NeedMore) {
+            // 半帧：检查首字节到达至今的时间
+            if (!conn.input.empty() && Clock::now() - input_received_at(conn, 0) >= frame_timeout) {
+                return CollectResult::FrameTimeout;
+            }
+            return CollectResult::NeedMore;
+        }
+        // 完整帧：只检查收齐耗时，不计之后的排队时间
+        InputTimeCursor time(conn);
+        const auto first = time.at(0);
+        const auto last = time.at(frame_size - 1);
+        if (last - first >= frame_timeout) {
+            return CollectResult::FrameTimeout;
+        }
+        if (conn.next_sequence == UINT64_MAX) {
+            return CollectResult::SequenceExhausted;
+        }
+        const std::size_t payload_bytes = frame_size - header_bytes;
+        if (!budget.try_reserve(payload_bytes)) {
+            return CollectResult::BudgetLimit;
+        }
+
+        const std::size_t old_queue_size = conn.pending_request.size();
+        try {
+            conn.pending_request.emplace_back();
+            RequestTask& task = conn.pending_request.back();
+            task.connection_id = conn.id;
+            task.sequence = conn.next_sequence;
+            task.payload.assign(conn.input.data() + header_bytes, payload_bytes);
+        } catch (...) {
+            // emplace 自身失败时，不能误删原来的队尾
+            if (conn.pending_request.size() > old_queue_size) {
+                conn.pending_request.pop_back();
+            }
+            budget.release(payload_bytes);
+            throw;
+        }
+        // 成功入队后，再消费输入及其时间记录
+        consume_input_times(conn, frame_size);
+        conn.input.erase(0, frame_size);
+        budget.release(frame_size);
+        release_empty_buffer(conn.input);
+
+        ++conn.next_sequence;
+        --max_frames;
+    }
+    return CollectResult::FrameLimit;
 }
 
 // 此时未解析的input不再接纳；同步执行过的命令已生成output，只排空这些响应。
