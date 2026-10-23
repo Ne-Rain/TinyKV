@@ -561,7 +561,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     const std::size_t frame_bytes = 4 + completion.response.size();
     const std::size_t pending = conn.output.size() - conn.sent;
     const std::size_t output_limit = 64 * 1024;
-    if (pending < output_limit || frame_bytes > output_limit - pending) {
+    if (pending > output_limit || frame_bytes > output_limit - pending) {
         return discard_and_close();
     }
     // 覆盖临时 frame，以及追加到 output 时新增的数据副本
@@ -720,8 +720,8 @@ int run_reactor_server(const ServerOptions& so) {
     epoll_event completion_event{};
     completion_event.events = EPOLLIN;
     completion_event.data.u64 = completion_event_id;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, signals.fd(), &signal_event) == -1) {
-        log_fd_error("epoll_ctl ADD signalfd", signal_event_id, signals.fd(), errno);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, notifier.fd(), &completion_event) == -1) {
+        log_fd_error("epoll_ctl ADD signalfd", completion_event_id, notifier.fd(), errno);
         close(epfd);
         close(lfd);
         return 1;
@@ -783,20 +783,24 @@ int run_reactor_server(const ServerOptions& so) {
             }
             if (id == completion_event_id) {
                 if (ready & (EPOLLERR | EPOLLHUP)) {
-                    std::cerr << "completion event failure, fd=" << signals.fd() << ", events=" << ready
+                    std::cerr << "completion event failure, fd=" << notifier.fd() << ", events=" << ready
                               << '\n';
                     exit_code = 1;
                     flag = 1;
                     break;
                 }
                 if (!notifier.drain()) {
-                    continue;
+                    std::cerr << "completion drain failure, fd=" << notifier.fd() << '\n';
+                    exit_code = 1;
+                    flag = 1;
+                    break;
                 }
-                std::deque<Completion> batch = completed.take_all();
+                auto batch = completed.take_all();
                 for (auto& completion : batch) {
-                    bool ok = consume_completion(epfd, completion, tasks, connections, quota, budb);
-                    if (!ok) {
-                        log_socket_error("consume completion failure", completion_event_id, lfd);
+                    if (!consume_completion(epfd, completion, tasks, connections, quota, budb)) {
+                        std::cerr << "consume completion failure, id=" << completion.connection_id
+                                  << ", sequence=" << completion.sequence << '\n';
+
                         exit_code = 1;
                         flag = 1;
                         break;
@@ -805,6 +809,7 @@ int run_reactor_server(const ServerOptions& so) {
                 if (flag) {
                     break;
                 }
+                continue;
             }
             if (id == listen_event_id) {
                 if (shutdown_state.stopping || lfd < 0)
