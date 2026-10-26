@@ -17,7 +17,7 @@ std::string encode_frame(const std::string& payload) {
     std::uint32_t network_length = htonl(length);
 
     std::string frame;
-    const char* header = reinterpret_cast<const char*>(&network_length);
+    const char* header = reinterpret_cast<const char*>(&network_length); // 用字符串存储（只考虑实际储存字节）
     frame.append(header, sizeof(network_length));
     frame.append(payload);
     return frame;
@@ -28,12 +28,12 @@ ParseStatus peek_frame(const std::string& buffer, std::size_t offset, std::size_
     if (offset > buffer.size()) {
         return ParseStatus::ProtocolError;
     }
-    std::size_t available = buffer.size() - offset;
+    std::size_t available = buffer.size() - offset; // 计算余下字节是否有完整帧头（4字节）
     if (available < sizeof(std::uint32_t)) {
         return ParseStatus::NeedMore;
     }
     std::uint32_t network_length = 0;
-    std::memcpy(&network_length, buffer.data() + offset, sizeof(network_length));
+    std::memcpy(&network_length, buffer.data() + offset, sizeof(network_length)); // 读取实际数据长度
     std::uint32_t length = ntohl(network_length);
     if (length == 0 || length > 8192) {
         return ParseStatus::ProtocolError;

@@ -8,6 +8,7 @@
 #include "server.hpp"
 #include "task_quota.hpp"
 #include "task_registry.hpp"
+#include "task_runner.hpp"
 #include "thread_pool.hpp"
 #include <algorithm>
 #include <cassert>
@@ -20,6 +21,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdexcept>
@@ -46,6 +48,8 @@ enum class CollectResult {
     BudgetLimit,
     SequenceExhausted
 };
+
+enum class DispatchResult { NoRequest, InFlight, NoCapacity, Submitted, SubmitFailed };
 
 void log_fd_error(const char* operation, std::uint64_t id, int fd, int error) {
     std::cerr << operation << ", id=" << id << ", fd=" << fd << ", error=" << error
@@ -260,6 +264,7 @@ void release_empty_buffer(std::string& buffer) {
     }
 }
 
+// 清理input和时间队列
 void discard_input(Connection& conn, Budget_Bytes& budget) {
     assert(budget.used_bytes >= conn.input.size());
     budget.used_bytes -= conn.input.size();
@@ -511,7 +516,6 @@ bool update_interest(int epfd, const Connection& conn, bool stopping = false) {
 
 void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections, std::uint64_t id,
                       Budget_Bytes& budb) {
-
     auto it = connections.find(id);
     if (it == connections.end()) {
         return;
@@ -522,6 +526,12 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     }
     budb.used_bytes -= it->second.input.size();
     budb.used_bytes -= (it->second.output.size() - it->second.sent);
+    for (auto& request : it->second.pending_request) {
+        const std::size_t bytes = request.payload.size();
+        std::string{}.swap(request.payload);
+        budb.release(bytes);
+    }
+    it->second.pending_request.clear();
     close(fd);
     connections.erase(it);
 }
@@ -681,6 +691,75 @@ CollectResult collect_requests(Connection& conn, Budget_Bytes& budget, std::size
         --max_frames;
     }
     return CollectResult::FrameLimit;
+}
+
+DispatchResult try_dispatch_one(Connection& conn, InFlightTasks& tasks, TaskQuota& quota,
+                                Budget_Bytes& budget, ThreadPool& pool, KVStore& store,
+                                CompletionQueue& completed, const EventNotifier& notifier) {
+    if (conn.pending_request.empty()) {
+        return DispatchResult::NoRequest;
+    }
+
+    // 同一连接最多允许一个在途任务。
+    if (tasks.find(conn.id) != tasks.end()) {
+        return DispatchResult::InFlight;
+    }
+
+    RequestTask& front = conn.pending_request.front();
+
+    const auto id = conn.id;
+    const auto sequence = front.sequence;
+    const auto request_bytes = front.payload.size();
+
+    std::shared_ptr<RequestTask> owned;
+    bool registered = false;
+    bool transferred = false;
+
+    try {
+        // 登记在途任务，预留任务名额和响应空间。
+        if (!register_task(tasks, id, sequence, quota, budget)) {
+            return DispatchResult::NoCapacity;
+        }
+        registered = true;
+
+        owned = std::make_shared<RequestTask>();
+        owned->connection_id = id;
+        owned->sequence = sequence;
+
+        // 正文预算已经由 collect_requests 计入，这里只记录。
+        tasks.at(id).request_bytes = request_bytes;
+
+        // 转移正文，队首节点暂时保留，便于失败时恢复。
+        owned->payload.swap(front.payload);
+        transferred = true;
+
+        pool.submit([owned, &store, &completed, &notifier]() {
+            run_request_task(std::move(*owned), store, completed, notifier);
+        });
+
+    } catch (...) {
+        // 提交没有成功，请求正文还给原来的队首节点。
+        if (transferred) {
+            owned->payload.swap(front.payload);
+        }
+
+        if (registered) {
+            // 正文重新属于待提交队列，保留它已有的预算。
+            tasks.at(id).request_bytes = 0;
+
+            // 归还本次预留的任务名额和响应空间。
+            if (!release_task(tasks, id, sequence, quota, budget)) {
+                std::terminate();
+            }
+        }
+
+        return DispatchResult::SubmitFailed;
+    }
+
+    // 提交成功后再删除队首节点。
+    conn.pending_request.pop_front();
+
+    return DispatchResult::Submitted;
 }
 
 // 此时未解析的input不再接纳；同步执行过的命令已生成output，只排空这些响应。

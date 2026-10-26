@@ -26,6 +26,7 @@ bool release_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64
         return false;
     }
     rollback_task(quota, budget, task->second.reservation);
+    budget.release(task->second.request_bytes);
     tasks.erase(connection_id);
     return true;
 }
@@ -45,6 +46,7 @@ bool finish_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_
     }
     const std::size_t unused = reserver.reservation.response_bytes - frame_bytes;
     budget.release(unused);
+    budget.release(task->second.request_bytes);
     quota.release();
     tasks.erase(task);
     return true;

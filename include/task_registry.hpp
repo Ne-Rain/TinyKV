@@ -8,6 +8,7 @@
 struct InFlightTask {
     std::uint64_t sequence{0};
     TaskReservation reservation;
+    std::size_t request_bytes{0};  // 从连接队列转交工作任务、尚未结算的请求正文预算
 };
 
 using InFlightTasks = std::unordered_map<std::uint64_t, InFlightTask>;
