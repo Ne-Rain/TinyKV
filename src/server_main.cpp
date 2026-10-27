@@ -1064,17 +1064,15 @@ int run_reactor_server(const ServerOptions& so) {
                         break;
                     }
                     const auto id = completion.connection_id;
-                    if (so.mode == "pool" && !shutdown_state.stopping) {
+                    if (so.mode == "pool") {
                         auto consume_conn = connections.find(id);
-
-                        const bool has_work =
-                            !consume_conn->second.pending_request.empty() ||
-                            (!shutdown_state.stopping && !consume_conn->second.input.empty());
-
-                        if (consume_conn != connections.end() && has_work) {
-                            if (consume_conn->second.queued == false) {
+                        if (consume_conn != connections.end()) {
+                            Connection& conn = consume_conn->second;
+                            const bool has_work = !conn.pending_request.empty() ||
+                                                  (!shutdown_state.stopping && !conn.input.empty());
+                            if (has_work && !conn.queued) {
                                 runnable.push_back(id);
-                                consume_conn->second.queued = true;
+                                conn.queued = true;
                             }
                         }
                     }
