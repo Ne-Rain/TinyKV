@@ -1016,10 +1016,21 @@ int run_reactor_server(const ServerOptions& so) {
                     if (!consume_completion(epfd, completion, tasks, connections, quota, budb)) {
                         std::cerr << "consume completion failure, id=" << completion.connection_id
                                   << ", sequence=" << completion.sequence << '\n';
-
                         exit_code = 1;
                         flag = 1;
                         break;
+                    }
+                    const auto id = completion.connection_id;
+                    if (so.mode == "pool" && !shutdown_state.stopping) {
+                        auto consume_conn = connections.find(id);
+                        if (consume_conn != connections.end() &&
+                            (!consume_conn->second.pending_request.empty() ||
+                             !consume_conn->second.input.empty())) {
+                            if (consume_conn->second.queued == false) {
+                                runnable.push_back(id);
+                                consume_conn->second.queued = true;
+                            }
+                        }
                     }
                 }
                 if (flag) {
