@@ -810,10 +810,20 @@ DispatchResult try_dispatch_one(Connection& conn, InFlightTasks& tasks, TaskQuot
     return DispatchResult::Submitted;
 }
 
+// 检查是否存在待提交和在途任务
+bool connection_drained(const Connection& conn, const InFlightTasks& tasks) {
+    if (conn.input.empty() && conn.pending_request.empty() && tasks.find(conn.id) == tasks.end() &&
+        conn.sent == conn.output.size() && !conn.queued) {
+        return true;
+    }
+    return false;
+}
+
 // 此时未解析的input不再接纳；同步执行过的命令已生成output，继续发送
 bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connection>& connections,
                     std::deque<std::uint64_t>& runnable, Budget_Bytes& budget, ShutdownState& state,
-                    Clock::time_point now, std::chrono::milliseconds grace, std::uint32_t signal_number) {
+                    Clock::time_point now, std::chrono::milliseconds grace, std::uint32_t signal_number,
+                    bool pool_mode, const InFlightTasks& tasks) {
     if (!state.begin(now, grace))
         return true;
     std::cerr << "shutdown begin, signal=" << signal_number << ", grace_ms=" << grace.count() << '\n';
@@ -829,7 +839,15 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
     for (auto it = connections.begin(); it != connections.end();) {
         Connection& conn = it->second;
         const std::uint64_t id = it->first;
-        ++it; // 统一关闭会erase；先保存下一位置。
+        if(!conn.pending_request.empty() && tasks.find(id) == tasks.end()){
+            runnable.push_back(id);
+            conn.queued = true;
+            continue;
+        }
+        if(tasks.find(id) != tasks.end()){
+            continue;
+        }
+        ++it; // 统一关闭会erase；先保存下一位置
         if (!conn.input.empty()) {
             std::cerr << "shutdown discard input, id=" << id << ", bytes=" << conn.input.size() << '\n';
         }
@@ -843,15 +861,6 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
         }
     }
     return ok;
-}
-
-// 检查是否存在待提交和在途任务
-bool connection_drained(const Connection& conn, const InFlightTasks& tasks) {
-    if (conn.input.empty() && conn.pending_request.empty() && tasks.find(conn.id) == tasks.end() &&
-        conn.sent == conn.output.size() && !conn.queued) {
-        return true;
-    }
-    return false;
 }
 
 // 一轮收集和提交的结果
@@ -1003,8 +1012,9 @@ int run_reactor_server(const ServerOptions& so) {
             exit_code = 1;
             break;
         }
-        if (signal_number != 0 && !begin_shutdown(epfd, lfd, connections, runnable, budb, shutdown_state,
-                                                  Clock::now(), so.shutdown_grace, signal_number)) {
+        if (signal_number != 0 &&
+            !begin_shutdown(epfd, lfd, connections, runnable, budb, shutdown_state, Clock::now(),
+                            so.shutdown_grace, signal_number, so.mode == "pool", tasks)) {
             exit_code = 1;
             break;
         }
