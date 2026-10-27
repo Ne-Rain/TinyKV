@@ -170,6 +170,7 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
     std::string mode = "blocking";
+    std::size_t threads{4};
     std::chrono::milliseconds idle_timeout{30000}; // 空闲超时
     std::chrono::milliseconds frame_timeout{10000}; // 帧接收超时（一帧必须在该时间内接收完成）
     std::chrono::milliseconds output_stall_timeout{10000}; // 输出停滞超时（防止响应一直不发）
@@ -305,6 +306,29 @@ bool frame_deadline_expired(const Connection& conn, Clock::time_point now,
     return false;
 }
 
+bool parse_thread_count(const std::string& text, std::size_t& count_out) {
+    if (text.empty()) {
+        return false;
+    }
+    std::size_t cout = 0;
+    const std::size_t limit = static_cast<std::size_t>(std::numeric_limits<std::size_t>::max());
+    for (char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        std::size_t digit = static_cast<std::size_t>(c - '0');
+        if (cout > (limit - digit) / 10) {
+            return false;
+        }
+        cout = cout * 10 + digit;
+    }
+    if (cout == 0 || cout > 64) {
+        return false;
+    }
+    count_out = cout;
+    return true;
+}
+
 bool parse_timeout_ms(const std::string& text, std::chrono::milliseconds& timeout_out) {
     if (text.empty()) {
         return false;
@@ -399,11 +423,23 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
                 return false;
             }
             ++i;
-            if (strcmp(argv[i], "blocking") != 0 && strcmp(argv[i], "reactor") != 0) {
+            if (strcmp(argv[i], "blocking") != 0 && strcmp(argv[i], "reactor") != 0 &&
+                strcmp(argv[i], "pool") != 0) {
                 error_out = "Unsupported mode: " + std::string(argv[i]);
                 return false;
             }
             so.mode = argv[i];
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc) {
+                error_out = "Missing parameter value";
+                return false;
+            }
+            std::size_t thread_count;
+            if (!parse_thread_count(argv[++i], thread_count)) {
+                error_out = "The threads must be a decimal integer ranging from 1 to 64";
+                return false;
+            }
+            so.threads = thread_count;
         } else {
             error_out = "Unkown option: " + std::string(argv[i]);
             return false;
@@ -574,7 +610,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     }
 
     const std::size_t reserved_bytes = registered->second.reservation.response_bytes;
-    
+
     // 任务未结算，响应未追加的失败路径
     auto discard_and_close = [&]() -> bool {
         std::string{}.swap(completion.response);
@@ -896,6 +932,16 @@ int run_reactor_server(const ServerOptions& so) {
     std::deque<std::uint64_t> runnable; // 需要处理的连接id
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
+    std::unique_ptr<ThreadPool> pool;
+    if (so.mode == "pool") {
+        try {
+            pool = std::unique_ptr<ThreadPool>(new ThreadPool(so.threads));
+        } catch (...) {
+            close(epfd);
+            close(lfd);
+            return 1;
+        }
+    }
     while (true) {
         if (shutdown_state.stopping && connections.empty())
             break;
@@ -1213,7 +1259,7 @@ int main(int argc, char* argv[]) {
         return run_blocking_server(so);
     }
 
-    if (so.mode == "reactor") {
+    if (so.mode == "reactor" || so.mode == "pool") {
         return run_reactor_server(so);
     }
 
