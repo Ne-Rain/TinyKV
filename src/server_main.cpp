@@ -839,6 +839,15 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
     return ok;
 }
 
+// 检查是否存在待提交和在途任务
+bool connection_drained(const Connection& conn, const InFlightTasks& tasks) {
+    if (conn.input.empty() && conn.pending_request.empty() && tasks.find(conn.id) == tasks.end() &&
+        conn.sent == conn.output.size() && !conn.queued) {
+        return true;
+    }
+    return false;
+}
+
 int run_blocking_server(const ServerOptions& options) {
     int listen_fd = create_listen_socket(options.host, options.port);
     if (listen_fd == -1) {
@@ -937,6 +946,7 @@ int run_reactor_server(const ServerOptions& so) {
         try {
             pool = std::unique_ptr<ThreadPool>(new ThreadPool(so.threads));
         } catch (...) {
+            std::cerr << "ThreadPool failure";
             close(epfd);
             close(lfd);
             return 1;
@@ -1148,7 +1158,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             // 3. 已读到 EOF，并且响应全部发送完成。
             if (!close_now && (shutdown_state.stopping || conn.read_closed) &&
-                conn.sent == conn.output.size() && !conn.queued && conn.input.empty()) {
+                connection_drained(conn, tasks)) {
                 close_now = true;
             }
 
@@ -1196,8 +1206,7 @@ int run_reactor_server(const ServerOptions& so) {
                 close_now = true;
             }
 
-            if (!close_now && conn.read_closed && !conn.queued && conn.input.empty() &&
-                conn.sent == conn.output.size()) {
+            if (!close_now && conn.read_closed && connection_drained(conn, tasks)) {
                 close_now = true;
             }
 
