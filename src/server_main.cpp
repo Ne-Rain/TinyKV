@@ -998,6 +998,9 @@ int run_reactor_server(const ServerOptions& so) {
             break;
         }
         int timeout = shutdown_state.wait_timeout(runnable.empty(), Clock::now());
+        if (so.mode == "pool" && shutdown_state.stopping && !runnable.empty()) {
+            timeout = 0;
+        }
         int n = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), timeout);
         if (n == -1) {
             if (errno == EINTR) {
@@ -1063,9 +1066,12 @@ int run_reactor_server(const ServerOptions& so) {
                     const auto id = completion.connection_id;
                     if (so.mode == "pool" && !shutdown_state.stopping) {
                         auto consume_conn = connections.find(id);
-                        if (consume_conn != connections.end() &&
-                            (!consume_conn->second.pending_request.empty() ||
-                             !consume_conn->second.input.empty())) {
+
+                        const bool has_work =
+                            !consume_conn->second.pending_request.empty() ||
+                            (!shutdown_state.stopping && !consume_conn->second.input.empty());
+
+                        if (consume_conn != connections.end() && has_work) {
                             if (consume_conn->second.queued == false) {
                                 runnable.push_back(id);
                                 consume_conn->second.queued = true;
@@ -1229,7 +1235,12 @@ int run_reactor_server(const ServerOptions& so) {
         }
         if (flag)
             break;
-        std::size_t turns = shutdown_state.stopping ? 0 : std::min<std::size_t>(runnable.size(), 32);
+        std::size_t turns;
+        if (so.mode == "pool") {
+            turns = std::min<std::size_t>(runnable.size(), 32);
+        } else {
+            turns = shutdown_state.stopping ? 0 : std::min<std::size_t>(runnable.size(), 32);
+        }
         for (std::size_t turn = 0; turn < turns; ++turn) {
             std::uint64_t task_id = runnable.front();
             runnable.pop_front();
@@ -1240,28 +1251,48 @@ int run_reactor_server(const ServerOptions& so) {
             Connection& conn = it->second;
             conn.queued = false;
             bool close_now = false;
-            auto result = process_input(conn, store, max_frames, budb, so.frame_timeout);
-            if (result == ProcessResult::BudgetExhausted) {
-                if (!conn.queued) {
-                    runnable.push_back(conn.id);
-                    conn.queued = true;
+            if (so.mode == "pool") {
+                auto result = process_pool_turn(conn, max_frames, so.frame_timeout, tasks, quota, budb, *pool,
+                                                store, completed, notifier);
+                auto collect_result = result.collect_result;
+                if (collect_result == CollectResult::ProtocolError ||
+                    collect_result == CollectResult::FrameTimeout ||
+                    collect_result == CollectResult::BudgetLimit ||
+                    collect_result == CollectResult::SequenceExhausted) {
+                    close_now = true;
                 }
-            } else if (result == ProcessResult::NeedMore) {
-                // 所有完整帧已经处理完。
-                if (conn.read_closed && !conn.input.empty()) {
-                    // 已经 EOF，残留半帧不可能再补齐。
-                    std::cout << "discard incomplete frame, id=" << conn.id << "\n";
-                    discard_input(conn, budb);
+                if (result.dispatch_attempted) {
+                    auto dispatch_result = result.dispatch_result;
+                    if (dispatch_result == DispatchResult::SubmitFailed ||
+                        dispatch_result == DispatchResult::NoCapacity) {
+                        close_now = true;
+                    }
                 }
             } else {
+                auto result = process_input(conn, store, max_frames, budb, so.frame_timeout);
+                if (result == ProcessResult::BudgetExhausted) {
+                    if (!conn.queued) {
+                        runnable.push_back(conn.id);
+                        conn.queued = true;
+                    }
+                } else if (result == ProcessResult::NeedMore) {
+                    // 所有完整帧已经处理完。
+                    if (conn.read_closed && !conn.input.empty()) {
+                        // 已经 EOF，残留半帧不可能再补齐。
+                        std::cout << "discard incomplete frame, id=" << conn.id << "\n";
+                        discard_input(conn, budb);
+                    }
+                } else {
+                    close_now = true;
+                }
+            }
+
+            if (!close_now && (conn.read_closed || shutdown_state.stopping) &&
+                connection_drained(conn, tasks)) {
                 close_now = true;
             }
 
-            if (!close_now && conn.read_closed && connection_drained(conn, tasks)) {
-                close_now = true;
-            }
-
-            if (!close_now && !update_interest(epfd, conn)) {
+            if (!close_now && !update_interest(epfd, conn, shutdown_state.stopping)) {
                 perror("epoll_ctl MOD");
                 close_now = true;
             }
