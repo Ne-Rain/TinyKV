@@ -31,9 +31,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
+using CapacityWaiters = std::unordered_set<std::uint64_t>;
 
 constexpr std::uint64_t listen_event_id = 0;
 constexpr std::uint64_t signal_event_id = std::numeric_limits<std::uint64_t>::max();
@@ -49,7 +51,7 @@ enum class CollectResult {
     SequenceExhausted
 };
 
-enum class DispatchResult { NoRequest, InFlight, NoCapacity, Submitted, SubmitFailed };
+enum class DispatchResult { NoRequest, InFlight, NoTaskSlot, NoCapacity, Submitted, SubmitFailed };
 
 void log_fd_error(const char* operation, std::uint64_t id, int fd, int error) {
     std::cerr << operation << ", id=" << id << ", fd=" << fd << ", error=" << error
@@ -568,7 +570,7 @@ bool update_interest(int epfd, const Connection& conn, bool stopping = false) {
 }
 
 void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& connections, std::uint64_t id,
-                      Budget_Bytes& budb) {
+                      Budget_Bytes& budb, CapacityWaiters& waiters) {
     auto it = connections.find(id);
     if (it == connections.end()) {
         return;
@@ -586,13 +588,14 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     }
     it->second.pending_request.clear();
     close(fd);
+    waiters.erase(it->second.id);
     connections.erase(it);
 }
 
 // 处理已完成的任务
 bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
                         std::unordered_map<std::uint64_t, Connection>& connections, TaskQuota& quota,
-                        Budget_Bytes& budget, bool stopping) {
+                        Budget_Bytes& budget, bool stopping, CapacityWaiters& waiters) {
     const std::uint64_t id = completion.connection_id;
     const std::uint64_t sequence = completion.sequence;
     auto registered = tasks.find(id);
@@ -621,7 +624,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     auto discard_and_close = [&]() -> bool {
         std::string{}.swap(completion.response);
         const bool released = release_task(tasks, id, sequence, quota, budget);
-        close_connection(epfd, connections, id, budget);
+        close_connection(epfd, connections, id, budget, waiters);
         return released;
     };
 
@@ -674,7 +677,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
     }
 
     if (!update_interest(epfd, conn, stopping)) {
-        close_connection(epfd, connections, id, budget);
+        close_connection(epfd, connections, id, budget, waiters);
     }
     return true;
 }
@@ -753,6 +756,10 @@ DispatchResult try_dispatch_one(Connection& conn, InFlightTasks& tasks, TaskQuot
         return DispatchResult::InFlight;
     }
 
+    if (quota.used() >= quota.limit()) {
+        return DispatchResult::NoTaskSlot; // 任务名额不足
+    }
+
     RequestTask& front = conn.pending_request.front();
 
     const auto id = conn.id;
@@ -823,7 +830,7 @@ bool connection_drained(const Connection& conn, const InFlightTasks& tasks) {
 bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connection>& connections,
                     std::deque<std::uint64_t>& runnable, Budget_Bytes& budget, ShutdownState& state,
                     Clock::time_point now, std::chrono::milliseconds grace, std::uint32_t signal_number,
-                    bool pool_mode, const InFlightTasks& tasks) {
+                    bool pool_mode, const InFlightTasks& tasks, CapacityWaiters& waiter) {
     if (!state.begin(now, grace))
         return true;
     std::cerr << "shutdown begin, signal=" << signal_number << ", grace_ms=" << grace.count() << '\n';
@@ -855,9 +862,9 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
 
         // 存在待提交或在途任务暂时不关闭连接
         if (drained) {
-            close_connection(epfd, connections, id, budget);
+            close_connection(epfd, connections, id, budget, waiter);
         } else if (!update_interest(epfd, conn, true)) {
-            close_connection(epfd, connections, id, budget);
+            close_connection(epfd, connections, id, budget, waiter);
             ok = false;
         }
     }
@@ -884,6 +891,22 @@ PoolTurnResult process_pool_turn(Connection& conn, std::size_t max_frames,
     result.dispatch_result = dis_res;
     result.dispatch_attempted = true;
     return result;
+}
+
+// 把因容量不足等待提交的连接重新加入runnable
+void wake_capacity_waiters(CapacityWaiters& waiters,
+                           std::unordered_map<std::uint64_t, Connection>& connections,
+                           std::deque<std::uint64_t>& runnable) {
+    for (auto id : waiters) {
+        if (connections.find(id) == connections.end()) {
+            continue;
+        }
+        if (connections.at(id).queued == false) {
+            runnable.push_back(id);
+            connections.at(id).queued = true;
+        }
+    }
+    waiters.clear();
 }
 
 int run_blocking_server(const ServerOptions& options) {
@@ -977,6 +1000,7 @@ int run_reactor_server(const ServerOptions& so) {
     std::uint64_t next_id = 1;
     std::unordered_map<std::uint64_t, Connection> connections;
     std::deque<std::uint64_t> runnable; // 需要处理的连接id
+    CapacityWaiters capacity_waiters;   // 因容量不足暂时没有提交的id集合
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
     std::unique_ptr<ThreadPool> pool;
@@ -1018,7 +1042,7 @@ int run_reactor_server(const ServerOptions& so) {
         }
         if (signal_number != 0 &&
             !begin_shutdown(epfd, lfd, connections, runnable, budb, shutdown_state, Clock::now(),
-                            so.shutdown_grace, signal_number, so.mode == "pool", tasks)) {
+                            so.shutdown_grace, signal_number, so.mode == "pool", tasks, capacity_waiters)) {
             exit_code = 1;
             break;
         }
@@ -1056,7 +1080,7 @@ int run_reactor_server(const ServerOptions& so) {
                 auto batch = completed.take_all();
                 for (auto& completion : batch) {
                     if (!consume_completion(epfd, completion, tasks, connections, quota, budb,
-                                            shutdown_state.stopping)) {
+                                            shutdown_state.stopping, capacity_waiters)) {
                         std::cerr << "consume completion failure, id=" << completion.connection_id
                                   << ", sequence=" << completion.sequence << '\n';
                         exit_code = 1;
@@ -1065,6 +1089,7 @@ int run_reactor_server(const ServerOptions& so) {
                     }
                     const auto id = completion.connection_id;
                     if (so.mode == "pool") {
+                        wake_capacity_waiters(capacity_waiters, connections, runnable);
                         auto consume_conn = connections.find(id);
                         if (consume_conn != connections.end()) {
                             Connection& conn = consume_conn->second;
@@ -1155,7 +1180,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             if (ready & EPOLLERR) {
                 log_socket_error("client EPOLLERR", conn.id, fd);
-                close_connection(epfd, connections, id, budb);
+                close_connection(epfd, connections, id, budb, capacity_waiters);
                 continue;
             }
             bool close_now = false;
@@ -1225,7 +1250,7 @@ int run_reactor_server(const ServerOptions& so) {
 
             // 5. 统一关闭；此后不再使用 conn。
             if (close_now) {
-                close_connection(epfd, connections, conn.id, budb);
+                close_connection(epfd, connections, conn.id, budb, capacity_waiters);
                 continue; // 处理下一个 events[i]。
             }
             if (flag)
@@ -1246,6 +1271,10 @@ int run_reactor_server(const ServerOptions& so) {
             if (it == connections.end()) {
                 continue;
             }
+            // 移除容量等待id
+            if (capacity_waiters.find(task_id) != capacity_waiters.end()) {
+                capacity_waiters.erase(task_id);
+            }
             Connection& conn = it->second;
             conn.queued = false;
             bool close_now = false;
@@ -1264,6 +1293,8 @@ int run_reactor_server(const ServerOptions& so) {
                     if (dispatch_result == DispatchResult::SubmitFailed ||
                         dispatch_result == DispatchResult::NoCapacity) {
                         close_now = true;
+                    } else if (dispatch_result == DispatchResult::NoTaskSlot) {
+                        capacity_waiters.insert(conn.id);
                     }
                 }
             } else {
@@ -1296,7 +1327,7 @@ int run_reactor_server(const ServerOptions& so) {
             }
 
             if (close_now) {
-                close_connection(epfd, connections, task_id, budb);
+                close_connection(epfd, connections, task_id, budb, capacity_waiters);
                 // conn 已失效，不再访问。
                 continue;
             }
@@ -1320,12 +1351,12 @@ int run_reactor_server(const ServerOptions& so) {
             }
         }
         for (std::uint64_t id : timeout_id) {
-            close_connection(epfd, connections, id, budb);
+            close_connection(epfd, connections, id, budb, capacity_waiters);
         }
     }
     while (!connections.empty()) {
         auto id = connections.begin()->first;
-        close_connection(epfd, connections, id, budb);
+        close_connection(epfd, connections, id, budb, capacity_waiters);
     }
     if (pool != nullptr) {
         pool->shutdown();
