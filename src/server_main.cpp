@@ -861,6 +861,7 @@ PoolTurnResult process_pool_turn(Connection& conn, std::size_t max_frames,
                                  CompletionQueue& completed, const EventNotifier& notifier) {
     PoolTurnResult result{CollectResult::NeedMore, false, DispatchResult::NoRequest};
     auto collect_res = collect_requests(conn, budget, max_frames, frame_timeout);
+    result.collect_result = collect_res;
     if (collect_res == CollectResult::ProtocolError || collect_res == CollectResult::FrameTimeout ||
         collect_res == CollectResult::BudgetLimit || collect_res == CollectResult::SequenceExhausted) {
         return result;
@@ -868,12 +869,10 @@ PoolTurnResult process_pool_turn(Connection& conn, std::size_t max_frames,
         if (conn.read_closed && !conn.input.empty()) {
             discard_input(conn, budget);
         }
-    } else{
-        auto dis_res = try_dispatch_one(conn, tasks, quota, budget, pool, store, completed, notifier);
-        result.collect_result = collect_res;
-        result.dispatch_result = dis_res;
-        result.dispatch_attempted = true;
     }
+    auto dis_res = try_dispatch_one(conn, tasks, quota, budget, pool, store, completed, notifier);
+    result.dispatch_result = dis_res;
+    result.dispatch_attempted = true;
     return result;
 }
 
