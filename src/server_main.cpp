@@ -202,6 +202,12 @@ struct Connection {
         : id(connection_id), fd(socket_fd), last_activity(last_activity_time) {}
 };
 
+struct PoolTurnResult {
+    CollectResult collect_result;
+    bool dispatch_attempted; // 为true表示结果有效
+    DispatchResult dispatch_result;
+};
+
 // 游标按递增偏移查询接收时间，使多帧扫描只遍历每个批次一次。
 class InputTimeCursor {
 public:
@@ -846,6 +852,29 @@ bool connection_drained(const Connection& conn, const InFlightTasks& tasks) {
         return true;
     }
     return false;
+}
+
+// 一轮收集和提交的结果
+PoolTurnResult process_pool_turn(Connection& conn, std::size_t max_frames,
+                                 std::chrono::milliseconds frame_timeout, InFlightTasks& tasks,
+                                 TaskQuota& quota, Budget_Bytes& budget, ThreadPool& pool, KVStore& store,
+                                 CompletionQueue& completed, const EventNotifier& notifier) {
+    PoolTurnResult result{CollectResult::NeedMore, false, DispatchResult::NoRequest};
+    auto collect_res = collect_requests(conn, budget, max_frames, frame_timeout);
+    if (collect_res == CollectResult::ProtocolError || collect_res == CollectResult::FrameTimeout ||
+        collect_res == CollectResult::BudgetLimit || collect_res == CollectResult::SequenceExhausted) {
+        return result;
+    } else if (collect_res == CollectResult::NeedMore) {
+        if (conn.read_closed && !conn.input.empty()) {
+            discard_input(conn, budget);
+        }
+    } else{
+        auto dis_res = try_dispatch_one(conn, tasks, quota, budget, pool, store, completed, notifier);
+        result.collect_result = collect_res;
+        result.dispatch_result = dis_res;
+        result.dispatch_attempted = true;
+    }
+    return result;
 }
 
 int run_blocking_server(const ServerOptions& options) {
