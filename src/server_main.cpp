@@ -592,7 +592,7 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
 // 处理已完成的任务
 bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
                         std::unordered_map<std::uint64_t, Connection>& connections, TaskQuota& quota,
-                        Budget_Bytes& budget) {
+                        Budget_Bytes& budget, bool stopping) {
     const std::uint64_t id = completion.connection_id;
     const std::uint64_t sequence = completion.sequence;
     auto registered = tasks.find(id);
@@ -673,7 +673,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
         std::terminate();
     }
 
-    if (!update_interest(epfd, conn)) {
+    if (!update_interest(epfd, conn, stopping)) {
         close_connection(epfd, connections, id, budget);
     }
     return true;
@@ -1041,7 +1041,8 @@ int run_reactor_server(const ServerOptions& so) {
                 }
                 auto batch = completed.take_all();
                 for (auto& completion : batch) {
-                    if (!consume_completion(epfd, completion, tasks, connections, quota, budb)) {
+                    if (!consume_completion(epfd, completion, tasks, connections, quota, budb,
+                                            shutdown_state.stopping)) {
                         std::cerr << "consume completion failure, id=" << completion.connection_id
                                   << ", sequence=" << completion.sequence << '\n';
                         exit_code = 1;
@@ -1286,6 +1287,18 @@ int run_reactor_server(const ServerOptions& so) {
         auto id = connections.begin()->first;
         close_connection(epfd, connections, id, budb);
     }
+    if (pool != nullptr) {
+        pool->shutdown();
+    }
+    completed.take_all();
+    while (!tasks.empty()) {
+        auto it = tasks.begin();
+        const auto id = it->first;
+        const auto sequence = it->second.sequence;
+        release_task(tasks, id, sequence, quota, budb);
+    }
+    assert(tasks.empty());
+    assert(quota.used() == 0);
     assert(budb.used_bytes == 0);
     std::cerr << "reactor stopped, used=" << budb.used_bytes << ", peak=" << budb.peak_bytes << '\n';
     close(epfd);
