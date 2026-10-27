@@ -8,6 +8,7 @@
 #include <new>
 #include <utility>
 
+// 执行请求任务
 void run_request_task(RequestTask task, KVStore& store, CompletionQueue& completed,
                       const EventNotifier& notifier) {
     try {
@@ -33,7 +34,7 @@ void run_request_task(RequestTask task, KVStore& store, CompletionQueue& complet
                          static_cast<unsigned long long>(task.sequence));
             completion.response = "ERR INTERNAL";
         }
-        std::string{}.swap(task.payload);
+        std::string{}.swap(task.payload); // 释放请求正文
         // 发布阶段：必须先入队，再通知。
         completed.push(std::move(completion));
         if (!notifier.notify()) {

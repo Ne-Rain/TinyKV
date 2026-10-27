@@ -2,6 +2,7 @@
 #include "server.hpp"
 #include <cstddef>
 
+// 登记在途任务，预留任务名额和响应空间
 bool register_task(InFlightTasks& tasks, std::uint64_t connection_id, std::uint64_t sequence,
                    TaskQuota& quota, Budget_Bytes& budget) {
     if (tasks.find(connection_id) != tasks.end()) {

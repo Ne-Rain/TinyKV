@@ -83,6 +83,7 @@ public:
         }
     }
 
+    // 准备接收退出信号
     bool open() {
         sigset_t mask;
         sigemptyset(&mask);
@@ -133,10 +134,12 @@ private:
     bool mask_installed_ = false;
 };
 
+// 信号终止程序处理
 struct ShutdownState {
-    bool stopping = false;
-    Clock::time_point drain_deadline{};
+    bool stopping = false;              // 是否进入停止、排空阶段
+    Clock::time_point drain_deadline{}; // 排空阶段的停止时间
 
+    // 首次进入停止状态
     bool begin(Clock::time_point now, std::chrono::milliseconds grace) {
         if (stopping)
             return false;
@@ -145,8 +148,10 @@ struct ShutdownState {
         return true;
     }
 
+    // 是否到达截止时间
     bool expired(Clock::time_point now) const { return stopping && now >= drain_deadline; }
 
+    // 决定epoll_wait等多久（runnable为空最多等200ms，非空等待0）
     int wait_timeout(bool runnable_empty, Clock::time_point now) const {
         if (!stopping)
             return runnable_empty ? 200 : 0;
@@ -165,12 +170,13 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     std::uint16_t port = 8888;
     std::string mode = "blocking";
-    std::chrono::milliseconds idle_timeout{30000};
-    std::chrono::milliseconds frame_timeout{10000};
-    std::chrono::milliseconds output_stall_timeout{10000};
-    std::chrono::milliseconds shutdown_grace{5000};
+    std::chrono::milliseconds idle_timeout{30000}; // 空闲超时
+    std::chrono::milliseconds frame_timeout{10000}; // 帧接收超时（一帧必须在该时间内接收完成）
+    std::chrono::milliseconds output_stall_timeout{10000}; // 输出停滞超时（防止响应一直不发）
+    std::chrono::milliseconds shutdown_grace{5000}; // 程序使用信号中断后，允许的排空超时
 };
 
+// 每批输入字节的接收时间（时间记录）
 struct InputChunk {
     std::size_t bytes;             // 这一批还有多少字节留在缓冲
     Clock::time_point received_at; // 这一批字节的接收时间
@@ -179,7 +185,7 @@ struct InputChunk {
 struct Connection {
     std::uint64_t id;
     int fd;
-    std::chrono::steady_clock::time_point last_activity;
+    std::chrono::steady_clock::time_point last_activity; // 最近的活动时间
     Clock::time_point output_progress_at;
     std::string input;
     std::deque<InputChunk> input_chunks;
@@ -187,8 +193,8 @@ struct Connection {
     std::size_t sent = 0;
     std::uint64_t next_sequence{0};          // 分配请求序号
     std::deque<RequestTask> pending_request; // 保存已经收齐、尚未提交的请求
-    bool read_closed = false;
-    bool queued = false;
+    bool read_closed = false;                // 是否还能读到数据（eg.客户端关闭了发送）
+    bool queued = false;                     // 是否在runnable队列中
 
     Connection(std::uint64_t connection_id, int socket_fd,
                std::chrono::steady_clock::time_point last_activity_time)
@@ -226,6 +232,7 @@ Clock::time_point input_received_at(const Connection& conn, std::size_t offset) 
     return times.at(offset);
 }
 
+// 消费一帧字节的时间记录
 void consume_input_times(Connection& conn, std::size_t bytes) {
     while (bytes > 0) {
         if (conn.input_chunks.empty()) {
@@ -241,6 +248,7 @@ void consume_input_times(Connection& conn, std::size_t bytes) {
     }
 }
 
+// 把接收到的数据保存到连接中
 void append_received_input(Connection& conn, const char* data, std::size_t bytes,
                            Clock::time_point received_at, Budget_Bytes& budget) {
     if (bytes == 0) {
@@ -405,6 +413,7 @@ bool parse_server_options(int argc, char* argv[], ServerOptions& options_out, st
     return true;
 }
 
+// 发送conn.output数据
 bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
     std::size_t remaining_budget = max_bytes;
     while (conn.sent < conn.output.size() && remaining_budget > 0) {
@@ -440,6 +449,7 @@ bool flush_output(Connection& conn, std::size_t max_bytes, Budget_Bytes& budb) {
     return true;
 }
 
+// 处理这条连接的输入，每条连接每次最多处理max_frames条帧
 ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_frames, Budget_Bytes& budb,
                             std::chrono::milliseconds frame_timeout = std::chrono::seconds(10)) {
     std::size_t max_send_bytes = 64 * 1024;
@@ -497,6 +507,7 @@ ProcessResult process_input(Connection& conn, KVStore& store, std::size_t max_fr
     return ProcessResult::BudgetExhausted;
 }
 
+// 这个连接有输出，开始关注EPOLLOUT
 bool update_interest(int epfd, const Connection& conn, bool stopping = false) {
 
     epoll_event event{};
@@ -536,17 +547,15 @@ void close_connection(int epfd, std::unordered_map<std::uint64_t, Connection>& c
     connections.erase(it);
 }
 
+// 处理已完成的任务
 bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
                         std::unordered_map<std::uint64_t, Connection>& connections, TaskQuota& quota,
                         Budget_Bytes& budget) {
     const std::uint64_t id = completion.connection_id;
     const std::uint64_t sequence = completion.sequence;
-    auto task = tasks.find(id);
-    if (task == tasks.end()) {
-        return false;
-    }
-    auto& resever = task->second;
-    if (!resever.reservation.active || resever.sequence != sequence) {
+    auto registered = tasks.find(id);
+    if (registered == tasks.end() || registered->second.sequence != sequence ||
+        !registered->second.reservation.active) {
         return false;
     }
     // 连接已经不存在，释放占有资源
@@ -557,19 +566,15 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
         }
         return false;
     }
-    // 连接存在
-    auto registered = tasks.find(id);
-    if (registered == tasks.end() || registered->second.sequence != sequence ||
-        !registered->second.reservation.active) {
-        return false;
-    }
 
+    // 连接存在
     auto& conn = connections.at(id);
     if (conn.sent > conn.output.size()) {
         return false;
     }
 
     const std::size_t reserved_bytes = registered->second.reservation.response_bytes;
+    
     // 任务未结算，响应未追加的失败路径
     auto discard_and_close = [&]() -> bool {
         std::string{}.swap(completion.response);
@@ -577,12 +582,13 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
         close_connection(epfd, connections, id, budget);
         return released;
     };
+
     if (reserved_bytes < 4 || completion.response.empty() ||
         completion.response.size() > reserved_bytes - 4) {
         return discard_and_close();
     }
     const std::size_t frame_bytes = 4 + completion.response.size();
-    const std::size_t pending = conn.output.size() - conn.sent;
+    const std::size_t pending = conn.output.size() - conn.sent; // 当前还未发送的字节数
     const std::size_t output_limit = 64 * 1024;
     if (pending > output_limit || frame_bytes > output_limit - pending) {
         return discard_and_close();
@@ -593,7 +599,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
         return discard_and_close();
     }
 
-    const bool was_empty = pending == 0;
+    const bool was_empty = pending == 0; // 追加响应之前，是否没有待发送数据
 
     try {
         // 移除已经发送的前缀
@@ -613,7 +619,7 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
             throw std::logic_error("completion settlement failed");
         }
         budget.release(temporary_bytes);
-        if (was_empty) {
+        if (was_empty) { // 首次加入响应，开始计算输出停滞时间
             conn.output_progress_at = Clock::now();
         }
     } catch (const std::exception& e) {
@@ -716,7 +722,7 @@ DispatchResult try_dispatch_one(Connection& conn, InFlightTasks& tasks, TaskQuot
     bool transferred = false;
 
     try {
-        // 登记在途任务，预留任务名额和响应空间。
+        // 登记在途任务，预留任务名额和响应空间
         if (!register_task(tasks, id, sequence, quota, budget)) {
             return DispatchResult::NoCapacity;
         }
@@ -762,14 +768,14 @@ DispatchResult try_dispatch_one(Connection& conn, InFlightTasks& tasks, TaskQuot
     return DispatchResult::Submitted;
 }
 
-// 此时未解析的input不再接纳；同步执行过的命令已生成output，只排空这些响应。
+// 此时未解析的input不再接纳；同步执行过的命令已生成output，继续发送
 bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connection>& connections,
                     std::deque<std::uint64_t>& runnable, Budget_Bytes& budget, ShutdownState& state,
                     Clock::time_point now, std::chrono::milliseconds grace, std::uint32_t signal_number) {
     if (!state.begin(now, grace))
         return true;
     std::cerr << "shutdown begin, signal=" << signal_number << ", grace_ms=" << grace.count() << '\n';
-    if (lfd >= 0) {
+    if (lfd >= 0) { // 移除监听socket，停止接入新连接
         if (epoll_ctl(epfd, EPOLL_CTL_DEL, lfd, nullptr) == -1) {
             perror("epoll_ctl DEL listen");
         }
@@ -887,7 +893,7 @@ int run_reactor_server(const ServerOptions& so) {
     int exit_code = 0;
     std::uint64_t next_id = 1;
     std::unordered_map<std::uint64_t, Connection> connections;
-    std::deque<std::uint64_t> runnable;
+    std::deque<std::uint64_t> runnable; // 需要处理的连接id
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
     while (true) {

@@ -23,13 +23,14 @@ std::string encode_frame(const std::string& payload) {
     return frame;
 }
 
+// 检查输入缓存中，从offset位置开始的一帧是否完整，并且得到该帧长度frame_size_out
 ParseStatus peek_frame(const std::string& buffer, std::size_t offset, std::size_t& frame_size_out) {
     frame_size_out = 0;
     if (offset > buffer.size()) {
         return ParseStatus::ProtocolError;
     }
-    std::size_t available = buffer.size() - offset; // 计算余下字节是否有完整帧头（4字节）
-    if (available < sizeof(std::uint32_t)) {
+    std::size_t available = buffer.size() - offset;
+    if (available < sizeof(std::uint32_t)) { // 余下字节是否有完整帧头（4字节）
         return ParseStatus::NeedMore;
     }
     std::uint32_t network_length = 0;

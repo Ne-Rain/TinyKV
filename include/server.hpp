@@ -10,6 +10,8 @@ struct TaskReservation {
     std::size_t response_bytes{0};
     bool active{false};
 };
+
+// 全局字节预算
 struct Budget_Bytes {
     explicit Budget_Bytes(std::size_t limit = 64 * 1024 * 1024) : limit_bytes(limit) {}
 

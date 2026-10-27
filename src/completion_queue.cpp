@@ -9,6 +9,7 @@ void CompletionQueue::push(Completion completion) {
     queue_.push_back(std::move(completion));
 }
 
+// 取出一批完成结果
 std::deque<Completion> CompletionQueue::take_all() {
     std::deque<Completion> batch;
     {
