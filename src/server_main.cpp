@@ -839,21 +839,22 @@ bool begin_shutdown(int epfd, int& lfd, std::unordered_map<std::uint64_t, Connec
     for (auto it = connections.begin(); it != connections.end();) {
         Connection& conn = it->second;
         const std::uint64_t id = it->first;
-        if(!conn.pending_request.empty() && tasks.find(id) == tasks.end()){
-            runnable.push_back(id);
-            conn.queued = true;
-            continue;
-        }
-        if(tasks.find(id) != tasks.end()){
-            continue;
-        }
         ++it; // 统一关闭会erase；先保存下一位置
         if (!conn.input.empty()) {
             std::cerr << "shutdown discard input, id=" << id << ", bytes=" << conn.input.size() << '\n';
         }
         discard_input(conn, budget);
         conn.queued = false;
-        if (conn.sent == conn.output.size()) {
+        if (pool_mode) {
+            if (!conn.pending_request.empty() && tasks.find(id) == tasks.end()) {
+                runnable.push_back(id);
+                conn.queued = true;
+            }
+        }
+        const bool drained = pool_mode ? connection_drained(conn, tasks) : (conn.sent == conn.output.size());
+
+        // 存在待提交或在途任务暂时不关闭连接
+        if (drained) {
             close_connection(epfd, connections, id, budget);
         } else if (!update_interest(epfd, conn, true)) {
             close_connection(epfd, connections, id, budget);
