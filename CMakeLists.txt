@@ -7,16 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_BUILD_TYPE Debug)
 
-# 收集 src 中的源文件。
-aux_source_directory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    CORE_SOURCES
-)
-
-# 服务端入口单独使用，不加入公共库。
-list(REMOVE_ITEM CORE_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/server_main.cpp"
-)
+# 按职责目录收集公共库实现；应用入口单独加入服务端目标。
+aux_source_directory("${CMAKE_CURRENT_SOURCE_DIR}/src/core" CORE_SOURCES)
+aux_source_directory("${CMAKE_CURRENT_SOURCE_DIR}/src/net" CORE_SOURCES)
+aux_source_directory("${CMAKE_CURRENT_SOURCE_DIR}/src/server" CORE_SOURCES)
+aux_source_directory("${CMAKE_CURRENT_SOURCE_DIR}/src/async" CORE_SOURCES)
+aux_source_directory("${CMAKE_CURRENT_SOURCE_DIR}/src/threading" CORE_SOURCES)
 
 add_library(tinykv_core STATIC ${CORE_SOURCES})
 
@@ -29,6 +25,9 @@ target_link_libraries(tinykv_core PUBLIC Threads::Threads)
 # 服务端。
 add_executable(tinykv_server
     src/server_main.cpp
+    src/app/server_options.cpp
+    src/app/blocking_server.cpp
+    src/app/reactor_server.cpp
 )
 target_link_libraries(tinykv_server PRIVATE tinykv_core)
 

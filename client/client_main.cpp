@@ -1,5 +1,5 @@
-#include "connection.hpp"
-#include "protocol.hpp"
+#include "net/connection.hpp"
+#include "core/protocol.hpp"
 #include <cstdint>
 #include <cstring>
 #include <iostream>
