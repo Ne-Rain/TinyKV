@@ -1184,6 +1184,11 @@ int run_reactor_server(const ServerOptions& so) {
                 close_connection(epfd, connections, id, budb, capacity_waiters);
                 continue;
             }
+            if (conn.read_paused && (ready & EPOLLHUP)) {
+                log_socket_error("client EPOLLHUP", conn.id, fd);
+                close_connection(epfd, connections, id, budb, capacity_waiters);
+                continue;
+            }
             bool close_now = false;
 
             // 1. 处理读取。
@@ -1283,9 +1288,9 @@ int run_reactor_server(const ServerOptions& so) {
                 auto result = process_pool_turn(conn, max_frames, so.frame_timeout, tasks, quota, budb, *pool,
                                                 store, completed, notifier);
                 constexpr std::size_t pending_limit = 64;
-                if(conn.pending_request.size() >= pending_limit){
+                if (conn.pending_request.size() >= pending_limit) {
                     conn.read_paused = true;
-                }else {
+                } else {
                     conn.read_paused = false;
                 }
                 auto collect_result = result.collect_result;
