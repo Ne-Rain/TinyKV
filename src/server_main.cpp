@@ -198,6 +198,7 @@ struct Connection {
     std::deque<RequestTask> pending_request; // 保存已经收齐、尚未提交的请求
     bool read_closed = false;                // 是否还能读到数据（eg.客户端关闭了发送）
     bool queued = false;                     // 是否在runnable队列中
+    bool read_paused = false;                // 暂停读取
 
     Connection(std::uint64_t connection_id, int socket_fd,
                std::chrono::steady_clock::time_point last_activity_time)
@@ -556,7 +557,7 @@ bool update_interest(int epfd, const Connection& conn, bool stopping = false) {
 
     epoll_event event{};
     event.data.u64 = conn.id;
-    if (!stopping && !conn.read_closed) {
+    if (!stopping && !conn.read_closed && !conn.read_paused) {
         event.events |= EPOLLIN | EPOLLRDHUP;
     }
     if (conn.sent < conn.output.size()) {
@@ -1000,7 +1001,7 @@ int run_reactor_server(const ServerOptions& so) {
     std::uint64_t next_id = 1;
     std::unordered_map<std::uint64_t, Connection> connections;
     std::deque<std::uint64_t> runnable; // 需要处理的连接id
-    CapacityWaiters capacity_waiters;   // 因容量不足暂时没有提交的id集合
+    CapacityWaiters capacity_waiters;   // 因任务名额不足暂时没有提交的id集合
     std::size_t max_frames = 16;
     KVStore store(1024 * 1024);
     std::unique_ptr<ThreadPool> pool;
@@ -1186,7 +1187,7 @@ int run_reactor_server(const ServerOptions& so) {
             bool close_now = false;
 
             // 1. 处理读取。
-            if (!shutdown_state.stopping && !conn.read_closed &&
+            if (!shutdown_state.stopping && !conn.read_closed && !conn.read_paused &&
                 (ready & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
                 char buffer[1024];
                 ssize_t received;
@@ -1281,6 +1282,12 @@ int run_reactor_server(const ServerOptions& so) {
             if (so.mode == "pool") {
                 auto result = process_pool_turn(conn, max_frames, so.frame_timeout, tasks, quota, budb, *pool,
                                                 store, completed, notifier);
+                constexpr std::size_t pending_limit = 64;
+                if(conn.pending_request.size() >= pending_limit){
+                    conn.read_paused = true;
+                }else {
+                    conn.read_paused = false;
+                }
                 auto collect_result = result.collect_result;
                 if (collect_result == CollectResult::ProtocolError ||
                     collect_result == CollectResult::FrameTimeout ||
