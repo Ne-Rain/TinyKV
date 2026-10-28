@@ -40,6 +40,7 @@ using CapacityWaiters = std::unordered_set<std::uint64_t>;
 constexpr std::uint64_t listen_event_id = 0;
 constexpr std::uint64_t signal_event_id = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t completion_event_id = signal_event_id - 1;
+constexpr std::size_t pending_request_limit = 64;
 
 enum class CollectResult {
     NeedMore,
@@ -686,9 +687,8 @@ bool consume_completion(int epfd, Completion& completion, InFlightTasks& tasks,
 CollectResult collect_requests(Connection& conn, Budget_Bytes& budget, std::size_t max_frames,
                                std::chrono::milliseconds frame_timeout) {
     const std::size_t header_bytes = 4;
-    const std::size_t queue_limit = 64;
     while (max_frames > 0) {
-        if (conn.pending_request.size() >= queue_limit) {
+        if (conn.pending_request.size() >= pending_request_limit) {
             return CollectResult::QueueFull;
         }
         std::size_t frame_size = 0;
@@ -1287,13 +1287,15 @@ int run_reactor_server(const ServerOptions& so) {
             if (so.mode == "pool") {
                 auto result = process_pool_turn(conn, max_frames, so.frame_timeout, tasks, quota, budb, *pool,
                                                 store, completed, notifier);
-                constexpr std::size_t pending_limit = 64;
-                if (conn.pending_request.size() >= pending_limit) {
+                if (conn.pending_request.size() >= pending_request_limit) {
                     conn.read_paused = true;
                 } else {
                     conn.read_paused = false;
                 }
                 auto collect_result = result.collect_result;
+                if (collect_result == CollectResult::FrameTimeout) {
+                    std::cerr << "frame receive timeout, id=" << conn.id << '\n';
+                }
                 if (collect_result == CollectResult::ProtocolError ||
                     collect_result == CollectResult::FrameTimeout ||
                     collect_result == CollectResult::BudgetLimit ||
